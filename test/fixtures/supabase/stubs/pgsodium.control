@@ -1,0 +1,4 @@
+comment = 'stub of pgsodium'
+default_version = '3.1.8'
+relocatable = false
+schema = pgsodium

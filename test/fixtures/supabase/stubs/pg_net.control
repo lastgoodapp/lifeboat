@@ -1,0 +1,4 @@
+comment = 'stub of pg_net'
+default_version = '0.14.0'
+relocatable = false
+schema = extensions

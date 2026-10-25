@@ -1,0 +1,5 @@
+comment = 'stub of supabase_vault'
+default_version = '0.2.8'
+relocatable = false
+schema = vault
+requires = 'pgsodium'

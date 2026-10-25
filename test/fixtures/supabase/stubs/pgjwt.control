@@ -1,0 +1,5 @@
+comment = 'stub of pgjwt'
+default_version = '0.2.0'
+relocatable = false
+schema = extensions
+requires = 'pgcrypto'

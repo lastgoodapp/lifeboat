@@ -1,0 +1,4 @@
+comment = 'stub of pg_graphql'
+default_version = '1.5.11'
+relocatable = false
+schema = graphql

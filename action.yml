@@ -1,0 +1,229 @@
+name: Lifeboat
+description: Copy a Postgres database, its Supabase Storage files, the repository's code, issues and pull requests, and optionally the Supabase setup, to the region you choose or any S3-compatible API. Once a month, restore the newest dump into throwaway Postgres.
+branding:
+  icon: life-buoy
+  color: blue
+
+inputs:
+  mode:
+    description: backup or restore-test
+    required: false
+    default: backup
+  database-url:
+    description: Session pooler Postgres URL on port 5432. The username must be role.project-ref, for example lastgood_backup.<project-ref>. Not the direct db.*.supabase.co host, and not the transaction pooler. LastGood can write this secret. A manual URL is the fallback.
+    required: false
+    default: ""
+  restore-database-url:
+    description: Throwaway Postgres URL used by restore-test.
+    required: false
+    default: ""
+  s3-endpoint:
+    description: S3-compatible API endpoint. Empty uses the Sydney region.
+    required: false
+    default: https://s3.ap-southeast-2.wasabisys.com
+  s3-region:
+    description: Region sent to the destination API.
+    required: false
+    default: ap-southeast-2
+  s3-bucket:
+    description: Destination bucket.
+    required: true
+  s3-access-key-id:
+    description: Destination access key.
+    required: true
+  s3-secret-access-key:
+    description: Destination secret key.
+    required: true
+  s3-prefix:
+    description: Key prefix inside the bucket.
+    required: false
+    default: lifeboat
+  encrypt:
+    description: Encrypt the dump on the runner before upload. true or false.
+    required: false
+    default: "true"
+  public-key:
+    description: The app's age public key (age1...). Copies are encrypted to it with age, which also detects any change to a copy. A repository variable, LIFEBOAT_PUBLIC_KEY. When empty, it is worked out from private-key.
+    required: false
+    default: ""
+  private-key:
+    description: The app's age private key (AGE-SECRET-KEY-1...), from the LIFEBOAT_PRIVATE_KEY secret. restore-test needs it to open copies. Leave it out to keep no private key in GitHub; then there is no automatic restore test.
+    required: false
+    default: ""
+  encryption-passphrase:
+    description: The older setup. A passphrase the customer typed, used only when no key pair is set, and to open passphrase copies until they age out. LastGood wrote it once and did not keep a copy.
+    required: false
+    default: ""
+  manage-retention:
+    description: When true, delete destination objects older than retention-days. Hosted storage sets this to false because the bucket lifecycle and object lock own retention.
+    required: false
+    default: "true"
+  retention-days:
+    description: Delete destination objects older than this many days when manage-retention is true.
+    required: false
+    default: "30"
+  monthly-copies:
+    description: When true, the first good backup of each UTC month is also copied to <prefix>/monthly/<YYYYMM>/ and kept for twelve months. Needs manage-retention true. Off by default. A repository variable, LIFEBOAT_MONTHLY_COPIES.
+    required: false
+    default: "false"
+  storage-login:
+    description: The storage login LastGood makes when you connect, the LIFEBOAT_STORAGE_LOGIN secret. Each backup signs in with it through Supabase's Storage API and copies every bucket. Its storage policies let it read every file and never add, change or delete one.
+    required: false
+    default: ""
+  supabase-publishable-key:
+    description: The project's publishable key (sb_publishable_..., or the legacy anon key), the LIFEBOAT_SUPABASE_PUBLISHABLE_KEY variable. Public, and needed to sign in the storage login.
+    required: false
+    default: ""
+  storage-s3-endpoint:
+    description: Optional source S3 endpoint, such as Supabase Storage's S3 API. Used only when storage-login is empty.
+    required: false
+    default: ""
+  storage-s3-region:
+    description: Region for the source storage API.
+    required: false
+    default: us-east-1
+  storage-s3-access-key-id:
+    description: Optional source access key.
+    required: false
+    default: ""
+  storage-s3-secret-access-key:
+    description: Optional source secret key.
+    required: false
+    default: ""
+  project:
+    description: Stable name sent with the check-in, such as the Supabase project ref.
+    required: false
+    default: ""
+  checkin-url:
+    description: Where a signed status is posted.
+    required: false
+    default: https://lastgood.app/api/checkin
+  checkin-secret:
+    description: HMAC secret. Leave empty to skip the check-in.
+    required: false
+    default: ""
+  github-token:
+    description: Reads every branch and tag, and the issues and pull requests with their comments, for the code copy. The workflow's own token, which its permissions limit to contents, issues and pull-requests, each read.
+    required: false
+    default: ${{ github.token }}
+  supabase-token:
+    description: Optional. A scoped Supabase access token (sbp_fc...) for this one project, with only these Read permissions - Edge Functions, Auth Config, Storage, Storage Config and Database. The LIFEBOAT_SUPABASE_TOKEN secret. When set, each backup also copies the Edge Functions source, auth and storage settings, buckets, cron jobs, database webhooks and the names of Vault secrets.
+    required: false
+    default: ""
+  supabase-project-ref:
+    description: The Supabase project ref for that copy and the storage copy. Empty works it out from the Session pooler username in database-url.
+    required: false
+    default: ""
+  vercel-token:
+    description: Optional. The customer's own Vercel token, the LIFEBOAT_VERCEL_TOKEN secret. When set, each backup also copies the Vercel project's environment variables (names and the values Vercel returns) and its settings, domains and DNS records, encrypted to the app's key on the runner. Only GET requests. Vercel never returns values it marks sensitive, so those are copied by name only. Without it there is no Vercel copy.
+    required: false
+    default: ""
+  vercel-project-id:
+    description: The Vercel project ID (prj_...) for that copy.
+    required: false
+    default: ""
+  vercel-team-id:
+    description: The Vercel team ID (team_...) when the project belongs to a team. Empty for a personal project.
+    required: false
+    default: ""
+  postgres-major:
+    description: Major version of the customer's Postgres. The client installed here matches the throwaway restore image.
+    required: false
+    default: "17"
+
+runs:
+  using: composite
+  steps:
+    - name: Install the Postgres client
+      shell: bash
+      env:
+        POSTGRES_MAJOR: ${{ inputs.postgres-major }}
+      run: |
+        major="${POSTGRES_MAJOR:-17}"
+        case "$major" in
+          12|13|14|15|16|17) ;;
+          *) echo "Postgres major must be 12, 13, 14, 15, 16 or 17." >&2; exit 1 ;;
+        esac
+        # The runner image already has an older pg_dump on PATH. The matching client lives here.
+        bin="/usr/lib/postgresql/${major}/bin"
+        ready() {
+          [[ -x "${bin}/pg_dump" && -x "${bin}/pg_restore" && -x "${bin}/psql" ]] || return 1
+          "${bin}/pg_dump" --version | grep -Eq " ${major}\.[0-9]"
+        }
+        if ! ready; then
+          sudo apt-get update
+          sudo apt-get install -y curl ca-certificates
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          # shellcheck disable=SC1091
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y "postgresql-client-${major}"
+        fi
+        if ! ready; then
+          echo "postgresql-client-${major} is not available at ${bin}. The runner's default pg_dump is a different major and cannot dump a newer server." >&2
+          exit 1
+        fi
+        echo "$bin" >> "$GITHUB_PATH"
+    - name: Install age
+      shell: bash
+      run: |
+        # age encrypts each copy to the app's public key and refuses to open a copy that was changed.
+        # Ubuntu's own package, signed by the Ubuntu archive (age 1.0 or later; every 1.x reads every copy).
+        ready() {
+          command -v age >/dev/null && command -v age-keygen >/dev/null
+        }
+        if ! ready; then
+          sudo apt-get update
+          sudo apt-get install -y age
+        fi
+        if ! ready; then
+          echo "age is not available on this runner." >&2
+          exit 1
+        fi
+        # A throwaway key proves this age can make a copy and open it again before any real copy depends on it.
+        check="$(mktemp -d)"
+        age-keygen -o "$check/key.txt" 2>/dev/null
+        printf 'lifeboat' | age --encrypt --recipient "$(age-keygen -y "$check/key.txt")" | age --decrypt --identity "$check/key.txt" > "$check/out"
+        [ "$(cat "$check/out")" = lifeboat ] || { echo "age did not round-trip a test copy on this runner." >&2; exit 1; }
+        rm -rf "$check"
+        echo "age $(age --version) is ready."
+    - name: Run Lifeboat
+      shell: bash
+      # LIFEBOAT_RESTORE_CONTAINER and LIFEBOAT_RESTORE_POSTGIS_IMAGE reach run.sh from the job environment
+      # when the workflow wrote them to $GITHUB_ENV. They let restore-test swap in PostGIS. See README.md.
+      env:
+        POSTGRES_MAJOR: ${{ inputs.postgres-major }}
+        LIFEBOAT_MODE: ${{ inputs.mode }}
+        DATABASE_URL: ${{ inputs.database-url }}
+        RESTORE_DATABASE_URL: ${{ inputs.restore-database-url }}
+        S3_ENDPOINT: ${{ inputs.s3-endpoint }}
+        S3_REGION: ${{ inputs.s3-region }}
+        S3_BUCKET: ${{ inputs.s3-bucket }}
+        S3_ACCESS_KEY_ID: ${{ inputs.s3-access-key-id }}
+        S3_SECRET_ACCESS_KEY: ${{ inputs.s3-secret-access-key }}
+        S3_PREFIX: ${{ inputs.s3-prefix }}
+        LIFEBOAT_ENCRYPT: ${{ inputs.encrypt }}
+        LIFEBOAT_PUBLIC_KEY: ${{ inputs.public-key }}
+        LIFEBOAT_PRIVATE_KEY: ${{ inputs.private-key }}
+        LIFEBOAT_ENCRYPTION_PASSPHRASE: ${{ inputs.encryption-passphrase }}
+        LIFEBOAT_MANAGE_RETENTION: ${{ inputs.manage-retention }}
+        RETENTION_DAYS: ${{ inputs.retention-days }}
+        LIFEBOAT_MONTHLY_COPIES: ${{ inputs.monthly-copies }}
+        LIFEBOAT_STORAGE_LOGIN: ${{ inputs.storage-login }}
+        SUPABASE_PUBLISHABLE_KEY: ${{ inputs.supabase-publishable-key }}
+        STORAGE_S3_ENDPOINT: ${{ inputs.storage-s3-endpoint }}
+        STORAGE_S3_REGION: ${{ inputs.storage-s3-region }}
+        STORAGE_S3_ACCESS_KEY_ID: ${{ inputs.storage-s3-access-key-id }}
+        STORAGE_S3_SECRET_ACCESS_KEY: ${{ inputs.storage-s3-secret-access-key }}
+        LIFEBOAT_PROJECT: ${{ inputs.project }}
+        CHECKIN_URL: ${{ inputs.checkin-url }}
+        CHECKIN_SECRET: ${{ inputs.checkin-secret }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        LIFEBOAT_SUPABASE_TOKEN: ${{ inputs.supabase-token }}
+        SUPABASE_PROJECT_REF: ${{ inputs.supabase-project-ref }}
+        LIFEBOAT_VERCEL_TOKEN: ${{ inputs.vercel-token }}
+        VERCEL_PROJECT_ID: ${{ inputs.vercel-project-id }}
+        VERCEL_TEAM_ID: ${{ inputs.vercel-team-id }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/run.sh"
