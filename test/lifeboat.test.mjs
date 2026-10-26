@@ -536,6 +536,97 @@ test("checkin.mjs signs with exactly the secret it is given, so a per-repository
   assert.doesNotMatch(body, new RegExp(given));
 });
 
+/** Runs checkin.mjs against a server answering each request with the next status in `statuses` (the last repeats). */
+async function checkinAgainst(statuses, { port: fixedPort, env = {} } = {}) {
+  const received = [];
+  let server = null;
+  let port = fixedPort;
+  if (!fixedPort) {
+    server = createServer((request, response) => {
+      let body = "";
+      request.on("data", (chunk) => (body += chunk));
+      request.on("end", () => {
+        received.push({ headers: request.headers, body });
+        const status = statuses[Math.min(received.length - 1, statuses.length - 1)];
+        response.writeHead(status, { "content-type": "application/json" });
+        response.end(status === 200 ? '{"ok":true}' : '{"error":"Check-in is not configured."}');
+      });
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    port = server.address().port;
+  }
+  const script = fileURLToPath(new URL("../scripts/checkin.mjs", import.meta.url));
+  try {
+    const result = await new Promise((resolve) => {
+      execFile(
+        process.execPath,
+        [script],
+        {
+          env: {
+            PATH: process.env.PATH,
+            CHECKIN_SECRET: "unit-test-checkin-secret",
+            CHECKIN_URL: `http://127.0.0.1:${port}/api/checkin`,
+            LIFEBOAT_PROJECT: "abcdefghijklmnopqrst",
+            LIFEBOAT_OK: "true",
+            LIFEBOAT_CHECKIN_WAIT_MS: "10",
+            ...env,
+          },
+        },
+        (error, stdout, stderr) => resolve({ code: error ? error.code : 0, output: `${stdout}${stderr}` }),
+      );
+    });
+    return { ...result, received };
+  } finally {
+    server?.close();
+  }
+}
+
+test("checkin.mjs tries again when LastGood answers 5xx, signing each try afresh", async () => {
+  const { code, output, received } = await checkinAgainst([503, 502, 200]);
+  assert.equal(code, 0);
+  assert.equal(received.length, 3);
+  assert.match(output, /Check-in failed \(503\)\. .*Trying again in 0 s\./);
+  assert.match(output, /Check-in accepted \(200\)/);
+  for (const { headers, body } of received) {
+    const timestamp = headers["x-lastgood-timestamp"];
+    assert.equal(verifyCheckin("unit-test-checkin-secret", timestamp, body, headers["x-lastgood-signature"], Number(timestamp) * 1000), true);
+  }
+  assert.equal(new Set(received.map(({ body }) => body)).size, 1);
+});
+
+test("checkin.mjs stops after three tries, and at once on a refusal", async () => {
+  const down = await checkinAgainst([503]);
+  assert.equal(down.code, 1);
+  assert.equal(down.received.length, 3);
+  assert.match(down.output, /Check-in failed \(503\)\. \{"error":"Check-in is not configured\."\}\n/);
+
+  const refused = await checkinAgainst([401]);
+  assert.equal(refused.code, 1);
+  assert.equal(refused.received.length, 1);
+  assert.doesNotMatch(refused.output, /Trying again/);
+});
+
+test("checkin.mjs says a good run's copies were made when only its check-in failed, and nothing more for a failed run", async () => {
+  const backup = await checkinAgainst([503]);
+  assert.match(backup.output, /The backup itself finished and tonight's copies were uploaded\. LastGood has no checksum record of them, so your login's Open here won't open tonight's copies \(the lastgood CLI can, with --unchecked\)\. Earlier nights aren't affected, and the next run checks in as usual\.\s*$/);
+  const restoreTest = await checkinAgainst([503], { env: { LIFEBOAT_KIND: "restore-test" } });
+  assert.match(restoreTest.output, /The test restore itself passed\. LastGood has no record of it, so your login won't show tonight's result\.\s*$/);
+  const failedRun = await checkinAgainst([503], { env: { LIFEBOAT_OK: "false" } });
+  assert.equal(failedRun.code, 1);
+  assert.doesNotMatch(failedRun.output, /itself (finished|passed)/);
+});
+
+test("checkin.mjs tries again when LastGood can't be reached, and says so without the secret", async () => {
+  const closed = createServer();
+  await new Promise((resolve) => closed.listen(0, "127.0.0.1", resolve));
+  const { port } = closed.address();
+  await new Promise((resolve) => closed.close(resolve));
+  const { code, output } = await checkinAgainst([], { port });
+  assert.equal(code, 1);
+  assert.equal(output.match(/Check-in failed \(LastGood could not be reached\)\./g)?.length, 3);
+  assert.doesNotMatch(output, /unit-test-checkin-secret/);
+});
+
 test("checkin.mjs sends what a test restore left out, by extension and count, and nothing of it for a backup", async () => {
   const received = [];
   const server = createServer((request, response) => {

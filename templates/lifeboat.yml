@@ -35,6 +35,14 @@ jobs:
   backup:
     if: github.event_name == 'push' || github.event_name == 'schedule' && github.event.schedule == '17 16 * * *' || github.event.inputs.mode == 'backup'
     runs-on: ubuntu-latest
+    # One backup at a time. A backup that starts while another is running, such as a merge during the night's run,
+    # waits for it instead of reading the database alongside it.
+    concurrency:
+      group: lifeboat-backup
+      cancel-in-progress: false
+    # A night that hangs stops here and is reported, instead of running for GitHub's six-hour default on your
+    # Actions minutes.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./lifeboat
@@ -72,6 +80,7 @@ jobs:
     # wizard sets LIFEBOAT_STRICT to true for it, and to false with a key whose private half is here.
     if: always() && vars.LIFEBOAT_STRICT != 'true' && (github.event_name == 'push' && needs.backup.result == 'success' || github.event_name == 'schedule' && github.event.schedule == '17 17 1 * *' || github.event.inputs.mode == 'restore-test')
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Start the restore database

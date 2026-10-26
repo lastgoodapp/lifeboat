@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { storageObjectCount, storageShortfall } from "../scripts/restore-list.mjs";
 import { copyStorage, parseLogin, safeSegment } from "../scripts/storage-copy.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
@@ -222,7 +224,23 @@ test("a file name that would leave its folder stops the copy before anything is 
 });
 
 // The whole backup, with fake tools, a fake bucket and a fake Supabase project on a local port.
-function fakeTools(dir) {
+/** pg_restore for a dump whose storage.objects holds `rows` files: its TOC line, and the rows when asked for them. */
+function pgRestoreWithObjects(rows) {
+  return `#!/bin/sh
+case " $* " in
+  *" --list "*) echo "4300; 0 17700 TABLE DATA storage objects supabase_storage_admin" ;;
+  *" -t objects "*)
+    echo "COPY storage.objects (id, bucket_id, name) FROM stdin;"
+    i=0
+    while [ $i -lt ${rows} ]; do printf 'id%s\tb\tn%s\n' "$i" "$i"; i=$((i + 1)); done
+    printf '%s\n' '\\.'
+    ;;
+esac
+exit 0
+`;
+}
+
+function fakeTools(dir, tools = {}) {
   const uploads = path.join(dir, "uploads");
   mkdirSync(uploads);
   writeFileSync(path.join(dir, "pg_dump"), '#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  if [ "$1" = "--file" ]; then printf \'dump\' > "$2"; exit 0; fi\n  shift\ndone\nexit 1\n');
@@ -237,6 +255,7 @@ case " $* " in
     prev=""; src=""
     for arg in "$@"; do [ "$arg" = "$last" ] && src="$prev"; prev="$arg"; done
     key="\${last#s3://*/}"
+    echo "upload $key: $(ls "$LIFEBOAT_WORKDIR" | tr '\n' ' ')" >> "${dir}/workdir.log"
     mkdir -p "${uploads}/$(dirname "$key")"
     cp "$src" "${uploads}/$key"
     ;;
@@ -252,14 +271,18 @@ esac
 exit 0
 `,
   );
-  writeFileSync(path.join(dir, "pg_restore"), "#!/bin/sh\nexit 0\n");
+  writeFileSync(path.join(dir, "pg_restore"), tools.pgRestore ?? "#!/bin/sh\nexit 0\n");
   for (const tool of ["pg_dump", "aws", "pg_restore"]) chmodSync(path.join(dir, tool), 0o755);
+  if (tools.age) {
+    writeFileSync(path.join(dir, "age"), tools.age);
+    chmodSync(path.join(dir, "age"), 0o755);
+  }
   return uploads;
 }
 
-async function backupWithStorage(extra = {}, fake = {}) {
+async function backupWithStorage(extra = {}, fake = {}, tools = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "lg-storage-run-"));
-  const uploads = fakeTools(dir);
+  const uploads = fakeTools(dir, tools);
   const work = path.join(dir, "work");
   mkdirSync(work);
   const keyFile = path.join(dir, "key.txt");
@@ -337,6 +360,31 @@ test("backup signs in with the storage login and uploads every file in one age a
   assert.ok(run.checkins[0].copies.some((copy) => copy.key.startsWith("lifeboat/storage/")));
 });
 
+test("the runner holds at most two copies of the files at once, and no encrypted dump: each goes once the next step has it", async () => {
+  const realAge = execFileSync("sh", ["-c", "command -v age"], { encoding: "utf8" }).trim();
+  const age = `#!/bin/sh
+case " $* " in
+  *storage.tar*) echo "age: $(ls "$LIFEBOAT_WORKDIR" | tr '\\n' ' ')" >> "$LIFEBOAT_WORKDIR/../workdir.log" ;;
+esac
+exec "${realAge}" "$@"
+`;
+  const run = await backupWithStorage({}, {}, { age });
+  assert.equal(run.status, 0, run.stderr);
+  const log = readFileSync(path.join(run.dir, "workdir.log"), "utf8").split("\n");
+  const listing = (line) => new Set(line.slice(line.indexOf(":") + 1).trim().split(" "));
+  const encrypting = log.find((line) => line.startsWith("age: "));
+  assert.ok(encrypting, "age encrypted the files archive");
+  assert.ok(listing(encrypting).has("storage.tar"));
+  assert.equal(listing(encrypting).has("storage"), false, "the folder is gone before encrypting");
+  const uploading = log.find((line) => line.startsWith("upload lifeboat/storage/"));
+  assert.ok(uploading, "the files archive was uploaded");
+  assert.equal(listing(uploading).has("storage"), false);
+  assert.equal(listing(uploading).has("storage.tar"), false, "the plain archive is gone before uploading");
+  assert.ok([...listing(uploading)].some((name) => name.startsWith("storage.tar.")), "only the encrypted archive is left");
+  assert.equal(listing(uploading).has("dump.backup.age"), false, "the encrypted dump went once it was uploaded");
+  assert.ok(listing(uploading).has("dump.backup"), "the plain dump stays for the users count");
+});
+
 test("with encryption off the files go up bucket by bucket, as the S3 path always did", async () => {
   const run = await backupWithStorage({ LIFEBOAT_ENCRYPT: "false", LIFEBOAT_PUBLIC_KEY: "" });
   assert.equal(run.status, 0, run.stderr);
@@ -364,4 +412,52 @@ test("a login Supabase refuses fails the run by name, after the other copies, an
   assert.doesNotMatch(readFileSync(path.join(run.dir, "aws.log"), "utf8"), /list-objects-v2|s3 rm /, "retention did not run");
   assert.equal(run.checkins[0].ok, false);
   assert.match(run.checkins[0].error, /did not accept the storage login/);
+});
+
+test("the dump's storage.objects rows are counted, and a short copy reads as hidden only when it is clearly short", async () => {
+  const spawnImpl = (_command, args) => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    const text = args.includes("objects") ? "COPY storage.objects (id, bucket_id, name) FROM stdin;\n1\tb\ta\n2\tb\tb\n\\.\n" : "";
+    setImmediate(() => {
+      child.stdout.emit("data", Buffer.from(text));
+      child.emit("close", 0);
+    });
+    return child;
+  };
+  const toc = "4300; 0 17700 TABLE DATA storage objects supabase_storage_admin\n";
+  assert.equal(await storageObjectCount({ toc, dumpPath: "d", pgRestore: "pg_restore", spawnImpl }), 2);
+  assert.equal(await storageObjectCount({ toc: "4268; 0 17467 TABLE DATA public notes postgres\n", dumpPath: "d", pgRestore: "pg_restore", spawnImpl }), null);
+  assert.deepEqual(storageShortfall(7, 7), { state: "ok", missing: 0 });
+  assert.deepEqual(storageShortfall(7, 9), { state: "ok", missing: 0 });
+  assert.deepEqual(storageShortfall(3, 0), { state: "hidden", missing: 3 });
+  assert.deepEqual(storageShortfall(8, 7), { state: "note", missing: 1 });
+  assert.deepEqual(storageShortfall(30, 7), { state: "hidden", missing: 23 });
+  assert.deepEqual(storageShortfall(1000, 960), { state: "note", missing: 40 });
+  assert.deepEqual(storageShortfall(1000, 950), { state: "hidden", missing: 50 });
+});
+
+test("a copy that matches the dump's files says nothing more, and passes", async () => {
+  const run = await backupWithStorage({}, {}, { pgRestore: pgRestoreWithObjects(7) });
+  assert.equal(run.status, 0, run.stderr);
+  assert.doesNotMatch(run.stdout + run.stderr, /hides|more than the files copy holds/);
+});
+
+test("a storage policy that hides files from the login fails the run by name, after uploading what it could read (B5)", async () => {
+  const run = await backupWithStorage({}, {}, { pgRestore: pgRestoreWithObjects(30) });
+  assert.notEqual(run.status, 0);
+  assert.match(
+    run.stderr,
+    /The storage login copied 7 files of the 30 your database listed a moment earlier, so a storage policy hides 23 from it\. .*\(aal2\)\. .*lastgood-backup@lastgood\.invalid.* The files it could read were uploaded\./,
+  );
+  assert.equal(readdirSync(path.join(run.uploads, "lifeboat", "storage")).length, 1, "the files it read still went up");
+  assert.equal(run.checkins[0].ok, false);
+  assert.match(run.checkins[0].error, /a storage policy hides 23 from it/);
+});
+
+test("a file or two short of the dump is noted as likely deleted, and the run passes", async () => {
+  const run = await backupWithStorage({}, {}, { pgRestore: pgRestoreWithObjects(8) });
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stdout, /Files: the database dump lists 1 file more than the files copy holds, most likely deleted between the two\./);
 });

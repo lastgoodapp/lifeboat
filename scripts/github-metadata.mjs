@@ -10,6 +10,11 @@ const PER_PAGE = 100;
 /** 100,000 items per list. A repository with more stops the copy instead of saving part of it. */
 const MAX_PAGES = 1000;
 const ATTEMPTS = 3;
+/**
+ * How long one call may take, its body included. Without it a call GitHub never answers waits as long as the job may
+ * run, on the repository's Actions minutes; with it the call is tried again like a dropped connection.
+ */
+export const CALL_TIMEOUT_MS = 60_000;
 
 /** What goes in the folder. Issues include pull requests, as GitHub lists them; pulls.json adds branch details. */
 export const LISTS = [
@@ -57,6 +62,7 @@ async function getJson(url, { token, fetchImpl, sleep, what }) {
           "User-Agent": "LastGood-lifeboat/0.1 (+https://lastgood.app)",
           "X-GitHub-Api-Version": "2022-11-28",
         },
+        signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
       });
     } catch {
       last = `GitHub could not be reached when reading ${what}.`;

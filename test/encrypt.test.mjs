@@ -18,6 +18,7 @@ test("the runner encrypts with openssl and does not delete when retention is off
   assert.match(source, /mask "\$\{LIFEBOAT_ENCRYPTION_PASSPHRASE:-\}"/);
   assert.match(source, /mask "\$\{CHECKIN_SECRET:-\}"/);
   assert.match(source, /"\$PG_DUMP" "\$DATABASE_URL" --format=custom --no-owner --no-acl/);
+  assert.match(source, /--no-acl --lock-wait-timeout=10min --file/);
   assert.match(source, /\/usr\/lib\/postgresql\/\$\{POSTGRES_MAJOR:-17\}\/bin/);
   assert.match(source, /cannot read Postgres/);
   assert.doesNotMatch(source, /psql "\$DATABASE_URL"/);

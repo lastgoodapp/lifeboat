@@ -5,7 +5,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { exportVercelEnv } from "../scripts/vercel-env.mjs";
+import { CALL_TIMEOUT_MS, exportVercelEnv } from "../scripts/vercel-env.mjs";
 import { exportVercelSettings, projectSettings } from "../scripts/vercel-settings.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
@@ -502,4 +502,36 @@ test("a settings copy that fails still uploads the environment variables, then f
   assert.equal(run.checkins[0].vercelEnvVars, 5);
   assert.equal(run.checkins[0].vercelDomains, null);
   assert.ok(!run.stderr.includes(TOKEN) && !shown(run.stdout).includes(TOKEN));
+});
+
+/** A call that never answers until its signal gives up, on a 5 ms clock in place of the real timeout. */
+function neverAnswers(t) {
+  const real = AbortSignal.timeout.bind(AbortSignal);
+  const timeout = t.mock.method(AbortSignal, "timeout", () => real(5));
+  let calls = 0;
+  const fetchImpl = (_url, init) => {
+    calls += 1;
+    if (!init?.signal) return Promise.reject(new Error("no signal: this call could wait forever"));
+    return new Promise((_resolve, reject) => {
+      // AbortSignal.timeout's timer doesn't hold the process open; a real stuck socket would.
+      const open = setInterval(() => {}, 1000);
+      init.signal.addEventListener("abort", () => {
+        clearInterval(open);
+        reject(init.signal.reason);
+      });
+    });
+  };
+  return { fetchImpl, calls: () => calls, limits: () => timeout.mock.calls.map((call) => call.arguments[0]) };
+}
+
+test("a Vercel call that never answers is given up after a minute and tried again, not left to run the job's clock down", { timeout: 5000 }, async (t) => {
+  const stuck = neverAnswers(t);
+  const file = path.join(mkdtempSync(path.join(tmpdir(), "lg-vercel-")), "vercel-env.json");
+  await assert.rejects(
+    exportVercelEnv({ api: API, project: PROJECT, team: TEAM, token: TOKEN, file, fetchImpl: stuck.fetchImpl, sleep: async () => {} }),
+    /Vercel could not be reached when reading/,
+  );
+  assert.equal(stuck.calls(), 3);
+  assert.deepEqual(stuck.limits(), [CALL_TIMEOUT_MS, CALL_TIMEOUT_MS, CALL_TIMEOUT_MS]);
+  assert.equal(CALL_TIMEOUT_MS, 60_000);
 });

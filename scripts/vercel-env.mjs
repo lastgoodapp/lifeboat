@@ -8,6 +8,11 @@ import { writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 const ATTEMPTS = 3;
+/**
+ * How long one call may take, its body included. Without it a call Vercel never answers waits as long as the job may
+ * run, on the repository's Actions minutes; with it the call is tried again like a dropped connection.
+ */
+export const CALL_TIMEOUT_MS = 60_000;
 const MAX_WAIT_MS = 60_000;
 /** A project ID (prj_...) or a project name. */
 export const PROJECT = /^[A-Za-z0-9._-]{1,100}$/;
@@ -58,6 +63,7 @@ export async function call(url, { token, fetchImpl, sleep, what }) {
           Authorization: `Bearer ${token}`,
           "User-Agent": "LastGood-lifeboat/0.1 (+https://lastgood.app)",
         },
+        signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
       });
     } catch {
       last = `Vercel could not be reached when reading ${what}.`;

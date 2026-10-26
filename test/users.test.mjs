@@ -100,8 +100,13 @@ test("LastGood's storage login is never counted as one of the app's users, nor i
   assert.ok(users.includes(STORAGE_LOGIN_EMAIL) && identities.includes("i9"));
   const counts = await authUserCounts({ toc: TOC, dumpPath: "d", pgRestore: "pg_restore", spawnImpl: fakeSpawn({ users, identities }) });
   assert.deepEqual(counts, { users: 3, withPassword: 2, identities: 3 });
-  // The address is the one setup makes.
-  const setup = readFileSync(path.join(import.meta.dirname, "..", "..", "lib", "supabase", "storage-login.ts"), "utf8");
+});
+
+// LastGood's own code sits next to the action only in the lastgood repository, not in the released Lifeboat repository.
+const STORAGE_LOGIN_SETUP = path.join(import.meta.dirname, "..", "..", "lib", "supabase", "storage-login.ts");
+
+test("the storage login's address is the one LastGood's setup makes", { skip: !existsSync(STORAGE_LOGIN_SETUP) && "needs the lastgood repository" }, () => {
+  const setup = readFileSync(STORAGE_LOGIN_SETUP, "utf8");
   assert.ok(setup.includes(`export const STORAGE_LOGIN_EMAIL = "${STORAGE_LOGIN_EMAIL}";`));
 });
 

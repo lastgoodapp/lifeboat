@@ -8,6 +8,12 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const ATTEMPTS = 3;
+/**
+ * How long one call may take, its body included: two minutes, since an Edge Function's files can run to a few
+ * megabytes. Without it a call Supabase never answers waits as long as the job may run, on the repository's Actions
+ * minutes; with it the call is tried again like a dropped connection.
+ */
+export const CALL_TIMEOUT_MS = 120_000;
 /** Supabase's rate limit resets each minute. A longer wait than that means something else is wrong. */
 const MAX_WAIT_MS = 60_000;
 export const PROJECT_REF = /^[a-z]{20}$/;
@@ -135,6 +141,7 @@ async function call(url, { token, fetchImpl, sleep, what, permission, accept = "
           ...(body === undefined ? {} : { "Content-Type": "application/json" }),
         },
         body,
+        signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
       });
     } catch {
       last = `Supabase could not be reached when reading ${what}.`;

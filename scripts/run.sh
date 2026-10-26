@@ -307,6 +307,61 @@ assert_client_can_read() {
   fi
 }
 
+# What the check-in says when a copy to or from the bucket fails, picked from aws's own message, as for pg_dump below.
+# aws's message stays in this log; the check-in gets the sentence instead of "Lifeboat failed with status 1".
+storage_failure_reason() {
+  case "$1" in
+    *InvalidAccessKeyId*|*SignatureDoesNotMatch*|*AccessDenied*|*"Access Denied"*|*Forbidden*|*"(403)"*)
+      echo "The storage refused the keys in LIFEBOAT_ACCESS_KEY_ID and LIFEBOAT_SECRET_ACCESS_KEY. If LastGood hosts your copies, write to hello@lastgood.app. With your own bucket, check the keys and that they may read and write it." ;;
+    *NoSuchBucket*)
+      echo "The bucket in LIFEBOAT_BUCKET doesn't exist at this storage address. Check its name, LIFEBOAT_S3_ENDPOINT and LIFEBOAT_S3_REGION." ;;
+    *PermanentRedirect*|*AuthorizationHeaderMalformed*|*IllegalLocationConstraintException*)
+      echo "The bucket is in another region than the workflow says. Check LIFEBOAT_S3_ENDPOINT and LIFEBOAT_S3_REGION." ;;
+    *"Could not connect to the endpoint URL"*|*"Connect timeout"*|*"Read timeout"*|*"Connection reset"*|*"(503)"*|*SlowDown*|*ServiceUnavailable*)
+      echo "The storage didn't answer, or was too busy. The next run tries again." ;;
+    *"No space left on device"*)
+      echo "The runner ran out of disk while copying to or from storage." ;;
+    *)
+      echo "Copying to or from storage failed. Its message is in this run's log in GitHub Actions." ;;
+  esac
+}
+
+# aws s3 cp or sync, and on a failure, the sentence above in the check-in.
+s3_copy() {
+  local status=0 err
+  aws_s3 s3 "$@" 2>"$WORKDIR/aws.err" || status=$?
+  err="$(cat "$WORKDIR/aws.err")"
+  rm -f "$WORKDIR/aws.err"
+  [[ -z "$err" ]] || printf '%s\n' "$err" >&2
+  [[ "$status" -eq 0 ]] || fail "$(storage_failure_reason "$err")"
+}
+
+# What the check-in says when pg_dump fails, picked from pg_dump's own message. That message stays in this log, where
+# GitHub masks the secrets it knows, and never goes in the check-in: pg_dump can echo a malformed DATABASE_URL back,
+# password included. Without this, the night's failure email said only "Lifeboat failed with status 1".
+dump_failure_reason() {
+  case "$1" in
+    *"Tenant or user not found"*)
+      echo "pg_dump could not sign in: Supabase's pooler doesn't know this project or its user. The project may be paused or deleted (a paused one can be restored from the Supabase dashboard), or DATABASE_URL names another project." ;;
+    *"password authentication failed"*)
+      echo "pg_dump could not sign in: the database refused the password in DATABASE_URL. Connect the repository again from LastGood, which sets a new one." ;;
+    *"could not translate host name"*)
+      echo "pg_dump could not reach the database: the host in DATABASE_URL doesn't exist. Connect the repository again from LastGood, or copy the Session pooler address from Supabase's Connect panel." ;;
+    *"remaining connection slots"*|*"too many connections"*|*"Max client connections"*)
+      echo "pg_dump could not connect: the database had no free connections. The next backup tries again." ;;
+    *"timeout expired"*|*"timed out"*|*"Connection refused"*|*"server closed the connection unexpectedly"*)
+      echo "pg_dump could not reach the database: it didn't answer. Supabase may be having an outage, or the project may be paused. The next backup tries again." ;;
+    *"lock timeout"*)
+      echo "pg_dump stopped: a table stayed locked for 10 minutes, usually by a long migration or a stuck session. The next backup tries again." ;;
+    *"permission denied"*)
+      echo "pg_dump was refused read access to part of the database. Connect the repository again from LastGood to give its backup login access again." ;;
+    *"No space left on device"*)
+      echo "pg_dump stopped: the runner ran out of disk while writing the dump." ;;
+    *)
+      echo "pg_dump could not read the database. Its message is in this run's log in GitHub Actions." ;;
+  esac
+}
+
 # Copies are encrypted with age to the app's public key (LIFEBOAT_PUBLIC_KEY), and only the private key
 # (LIFEBOAT_PRIVATE_KEY) opens them. age authenticates every chunk, so a changed or cut-short copy fails to
 # decrypt instead of restoring wrong data. The passphrase (OpenSSL AES-256-CBC, no authentication) is the
@@ -514,6 +569,7 @@ copy_storage() {
     rm -f "$WORKDIR/storage.err"
     read -r buckets STORAGE_OBJECTS bytes <<<"$counts"
     echo "Files: $(counted "$STORAGE_OBJECTS" file) in $(counted "$buckets" bucket), ${bytes} bytes, read with the storage login."
+    storage_shortfall
   elif [[ -n "${STORAGE_S3_ENDPOINT:-}" && -n "${STORAGE_S3_ACCESS_KEY_ID:-}" && -n "${STORAGE_S3_SECRET_ACCESS_KEY:-}" ]]; then
     STORAGE_SOURCE="s3"
     local storage_region="${STORAGE_S3_REGION:-us-east-1}"
@@ -541,19 +597,49 @@ copy_storage() {
   if [[ "$ENCRYPT" == "true" ]]; then
     local suffix
     suffix="$(encrypted_suffix)"
+    # Each step deletes what the next doesn't need, so the runner holds at most two copies of the files at once (the
+    # folder and the archive, then the archive and the encrypted archive), not three.
     tar -C "$root" -cf "$WORKDIR/storage.tar" .
+    rm -rf "$root"
     encrypt_file "$WORKDIR/storage.tar" "$WORKDIR/storage.tar${suffix}"
-    aws_s3 s3 cp "$WORKDIR/storage.tar${suffix}" "s3://${BUCKET}/${PREFIX}/storage/${STAMP}.tar${suffix}"
+    rm -f "$WORKDIR/storage.tar"
+    s3_copy cp "$WORKDIR/storage.tar${suffix}" "s3://${BUCKET}/${PREFIX}/storage/${STAMP}.tar${suffix}"
     record_copy "$WORKDIR/storage.tar${suffix}" "${PREFIX}/storage/${STAMP}.tar${suffix}"
     rm -f "$WORKDIR/storage.tar${suffix}"
   else
     local dest
     for dest in "$root"/*/; do
       [[ -d "$dest" ]] || continue
-      aws_s3 s3 sync "$dest" "s3://${BUCKET}/${PREFIX}/storage/$(basename "$dest")"
+      s3_copy sync "$dest" "s3://${BUCKET}/${PREFIX}/storage/$(basename "$dest")"
     done
   fi
   rm -rf "$root" "$WORKDIR/storage.tar"
+  if [[ -n "$STORAGE_HIDDEN" ]]; then
+    part_failed "$STORAGE_HIDDEN The files it could read were uploaded."
+  fi
+}
+
+# The dump lists every file in storage.objects, read past row level security. A storage policy that hides files from
+# the storage login gives it a short list and no error, so compare (B5). The check needs the dump's rows: without
+# them, or when pg_restore cannot list the dump, it says nothing and the copy stands as it is.
+STORAGE_HIDDEN=""
+storage_shortfall() {
+  local check state missing dumped
+  "$PG_RESTORE" --list "$WORKDIR/dump.backup" >"$WORKDIR/storage.toc" 2>/dev/null || {
+    rm -f "$WORKDIR/storage.toc"
+    return 0
+  }
+  check="$(LIFEBOAT_PG_RESTORE="$PG_RESTORE" node "$ROOT/scripts/restore-list.mjs" storage-check "$WORKDIR/storage.toc" "$WORKDIR/dump.backup" "$STORAGE_OBJECTS" 2>/dev/null || echo none)"
+  rm -f "$WORKDIR/storage.toc"
+  read -r state missing dumped <<<"$check"
+  case "$state" in
+    hidden)
+      STORAGE_HIDDEN="The storage login copied $(counted "$STORAGE_OBJECTS" file) of the ${dumped} your database listed a moment earlier, so a storage policy hides ${missing} from it. A restrictive policy does this, such as one that needs two-factor sign-in (aal2). Change it to leave out the storage login (lastgood-backup@lastgood.invalid), or those files are not in your backups."
+      ;;
+    note)
+      echo "Files: the database dump lists $(counted "$missing" file) more than the files copy holds, most likely deleted between the two. The next run copies what is there then."
+      ;;
+  esac
 }
 
 # Supabase Auth users ride in the dump as auth.users and auth.identities. Count the accounts, the ones with a
@@ -628,7 +714,7 @@ copy_code() {
   if [[ -n "$suffix" ]]; then
     encrypt_file "$WORKDIR/code.tar.gz" "$WORKDIR/code.tar.gz${suffix}"
   fi
-  aws_s3 s3 cp "$WORKDIR/code.tar.gz${suffix}" "s3://${BUCKET}/${PREFIX}/repo/${STAMP}.tar.gz${suffix}"
+  s3_copy cp "$WORKDIR/code.tar.gz${suffix}" "s3://${BUCKET}/${PREFIX}/repo/${STAMP}.tar.gz${suffix}"
   record_copy "$WORKDIR/code.tar.gz${suffix}" "${PREFIX}/repo/${STAMP}.tar.gz${suffix}"
   rm -rf "$dir" "$WORKDIR/code.tar.gz" "$WORKDIR/code.tar.gz${suffix}"
   echo "Code: ${CODE_BRANCHES} branches, ${CODE_TAGS} tags. GitHub: ${GITHUB_ISSUES} issues, ${GITHUB_PULLS} pull requests, ${GITHUB_COMMENTS} comments."
@@ -691,7 +777,7 @@ copy_supabase_setup() {
   local suffix
   suffix="$(encrypted_suffix)"
   encrypt_file "$WORKDIR/setup.tar.gz" "$WORKDIR/setup.tar.gz${suffix}"
-  aws_s3 s3 cp "$WORKDIR/setup.tar.gz${suffix}" "s3://${BUCKET}/${PREFIX}/setup/${STAMP}.tar.gz${suffix}"
+  s3_copy cp "$WORKDIR/setup.tar.gz${suffix}" "s3://${BUCKET}/${PREFIX}/setup/${STAMP}.tar.gz${suffix}"
   record_copy "$WORKDIR/setup.tar.gz${suffix}" "${PREFIX}/setup/${STAMP}.tar.gz${suffix}"
   rm -rf "$dir" "$WORKDIR/setup.tar.gz" "$WORKDIR/setup.tar.gz${suffix}"
   echo "Supabase setup: ${SETUP_FUNCTIONS} Edge Functions, auth and storage settings, ${SETUP_CRON_JOBS} cron jobs, ${webhooks} database webhooks, ${vault} Vault secret names."
@@ -741,7 +827,7 @@ copy_vercel_env() {
   encrypt_file "$WORKDIR/vercel.tar.gz" "$WORKDIR/vercel.tar.gz${suffix}"
   # The readable copy is gone before the upload starts.
   rm -rf "$dir" "$WORKDIR/vercel.tar.gz"
-  aws_s3 s3 cp "$WORKDIR/vercel.tar.gz${suffix}" "s3://${BUCKET}/${PREFIX}/vercel/${STAMP}.tar.gz${suffix}"
+  s3_copy cp "$WORKDIR/vercel.tar.gz${suffix}" "s3://${BUCKET}/${PREFIX}/vercel/${STAMP}.tar.gz${suffix}"
   record_copy "$WORKDIR/vercel.tar.gz${suffix}" "${PREFIX}/vercel/${STAMP}.tar.gz${suffix}"
   rm -f "$WORKDIR/vercel.tar.gz${suffix}"
   echo "Vercel: ${VERCEL_ENV_VARS} environment variables, ${VERCEL_ENV_VALUES} with their values."
@@ -812,7 +898,7 @@ restore_code() {
   local dir="$WORKDIR/code-restore"
   rm -rf "$dir"
   mkdir -p "$dir"
-  aws_s3 s3 cp "s3://${BUCKET}/${key}" "$WORKDIR/code.download"
+  s3_copy cp "s3://${BUCKET}/${key}" "$WORKDIR/code.download"
   open_code_copy "$key" "$WORKDIR/code.download" "$WORKDIR/code-restore.tar.gz"
   local listing names problem
   if ! listing="$(tar -tvzf "$WORKDIR/code-restore.tar.gz" 2>/dev/null)" || ! names="$(tar -tzf "$WORKDIR/code-restore.tar.gz" 2>/dev/null)"; then
@@ -882,7 +968,7 @@ restore_setup() {
   local dir="$WORKDIR/setup-restore"
   rm -rf "$dir"
   mkdir -p "$dir"
-  aws_s3 s3 cp "s3://${BUCKET}/${key}" "$WORKDIR/setup.download"
+  s3_copy cp "s3://${BUCKET}/${key}" "$WORKDIR/setup.download"
   if [[ "$key" == *.age ]]; then
     decrypt_age_file "$WORKDIR/setup.download" "$WORKDIR/setup-restore.tar.gz"
   elif [[ "$key" == *.enc ]]; then
@@ -940,7 +1026,7 @@ restore_storage() {
   local archive="$WORKDIR/storage-restore.tar"
   local dir="$WORKDIR/storage-restore"
   rm -rf "$dir" "$archive"
-  aws_s3 s3 cp "s3://${BUCKET}/${key}" "$WORKDIR/storage.download"
+  s3_copy cp "s3://${BUCKET}/${key}" "$WORKDIR/storage.download"
   if [[ "$key" == *.age ]]; then
     decrypt_age_file "$WORKDIR/storage.download" "$archive"
   elif [[ "$key" == *.enc ]]; then
@@ -1079,16 +1165,24 @@ if [[ "$MODE" == "backup" ]]; then
     resolve_recipient
   fi
   assert_client_can_read "$DATABASE_URL"
-  # Read-only. pg_dump does not write to the source database.
-  "$PG_DUMP" "$DATABASE_URL" --format=custom --no-owner --no-acl --file "$WORKDIR/dump.backup"
+  # Read-only. pg_dump does not write to the source database. It gives up after 10 minutes waiting for a table
+  # another session holds locked (a long migration, say), so the night fails and is reported instead of hanging.
+  dump_status=0
+  "$PG_DUMP" "$DATABASE_URL" --format=custom --no-owner --no-acl --lock-wait-timeout=10min --file "$WORKDIR/dump.backup" 2>"$WORKDIR/pg_dump.err" || dump_status=$?
+  cat "$WORKDIR/pg_dump.err" >&2
+  [[ "$dump_status" -eq 0 ]] || fail "$(dump_failure_reason "$(cat "$WORKDIR/pg_dump.err")")"
+  rm -f "$WORKDIR/pg_dump.err"
   DUMP_BYTES="$(wc -c <"$WORKDIR/dump.backup" | tr -d ' ')"
   if [[ "$ENCRYPT" == "true" ]]; then
     suffix="$(encrypted_suffix)"
     encrypt_file "$WORKDIR/dump.backup" "$WORKDIR/dump.backup${suffix}"
-    aws_s3 s3 cp "$WORKDIR/dump.backup${suffix}" "s3://${BUCKET}/${PREFIX}/db/${STAMP}.backup${suffix}"
+    s3_copy cp "$WORKDIR/dump.backup${suffix}" "s3://${BUCKET}/${PREFIX}/db/${STAMP}.backup${suffix}"
     record_copy "$WORKDIR/dump.backup${suffix}" "${PREFIX}/db/${STAMP}.backup${suffix}"
+    # Uploaded and recorded: the rest of the night needs only the plain dump (the users count reads it), so the
+    # encrypted copy doesn't take disk the files copy needs.
+    rm -f "$WORKDIR/dump.backup${suffix}"
   else
-    aws_s3 s3 cp "$WORKDIR/dump.backup" "s3://${BUCKET}/${PREFIX}/db/${STAMP}.backup"
+    s3_copy cp "$WORKDIR/dump.backup" "s3://${BUCKET}/${PREFIX}/db/${STAMP}.backup"
     record_copy "$WORKDIR/dump.backup" "${PREFIX}/db/${STAMP}.backup"
   fi
   copy_storage
@@ -1104,7 +1198,7 @@ elif [[ "$MODE" == "restore-test" ]]; then
   [[ -x "$PG_RESTORE" ]] || command -v "$PG_RESTORE" >/dev/null || fail "pg_restore is not installed."
   [[ -x "$PSQL" ]] || command -v "$PSQL" >/dev/null || fail "psql is not installed."
   key="$(latest_dump_key)" || fail "No .backup object was found under ${PREFIX}/db/."
-  aws_s3 s3 cp "s3://${BUCKET}/${key}" "$WORKDIR/restore.download"
+  s3_copy cp "s3://${BUCKET}/${key}" "$WORKDIR/restore.download"
   if [[ "$key" == *.age ]]; then
     decrypt_age_file "$WORKDIR/restore.download" "$WORKDIR/restore.backup"
     rm -f "$WORKDIR/restore.download"

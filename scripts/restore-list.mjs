@@ -930,6 +930,28 @@ export async function authUserCounts(options) {
   return { users: users.rows, withPassword: users.withValue, identities };
 }
 
+/** The files Supabase Storage held when the dump ran: the rows of storage.objects. Null when the dump has no such rows. */
+export async function storageObjectCount(options) {
+  const entries = String(options.toc).split("\n").map(parseTocLine).filter(Boolean);
+  if (!entries.some((entry) => entry.desc === "TABLE DATA" && entry.namespace === "storage" && entry.tag === "objects")) return null;
+  const counted = await countDumpRows(options.pgRestore, options.dumpPath, "objects", null, options.spawnImpl, "storage");
+  if (!counted) throw new Error("pg_restore did not return the storage.objects rows.");
+  return counted.rows;
+}
+
+/**
+ * Whether the storage login missed files its database lists (B5). Row level security hides rows rather than refusing,
+ * so a restrictive storage policy, such as one that needs two-factor sign-in (aal2), gives the login a short or empty
+ * list and no error. The dump is made just before the copy, so a few files deleted in between also show as missing:
+ * "hidden" only when nothing came back from a non-empty store, or at least 5 files and 5% of them are missing.
+ */
+export function storageShortfall(dumped, copied) {
+  const missing = dumped - copied;
+  if (missing <= 0) return { state: "ok", missing: 0 };
+  if (copied === 0 || missing >= Math.max(5, Math.ceil(dumped * 0.05))) return { state: "hidden", missing };
+  return { state: "note", missing };
+}
+
 /** After a test restore: the same counts must come back out of the throwaway database. */
 export async function verifyAuthUsers(options) {
   const dumped = await authUserCounts(options);
@@ -1216,6 +1238,18 @@ async function runAuthCount(tocPath, dumpPath) {
   process.stdout.write(counts ? `${counts.users} ${counts.withPassword} ${counts.identities}\n` : "none\n");
 }
 
+async function runStorageCheck(tocPath, dumpPath, copiedText) {
+  const copied = Number(copiedText);
+  if (!Number.isInteger(copied) || copied < 0) throw new Error("storage-check needs the number of files copied.");
+  const dumped = await storageObjectCount({ toc: readFileSync(tocPath, "utf8"), dumpPath, pgRestore: process.env.LIFEBOAT_PG_RESTORE || "pg_restore" });
+  if (dumped === null) {
+    process.stdout.write("none\n");
+    return;
+  }
+  const { state, missing } = storageShortfall(dumped, copied);
+  process.stdout.write(`${state} ${missing} ${dumped}\n`);
+}
+
 async function runAuthVerify(tocPath, dumpPath) {
   const databaseUrl = process.env.RESTORE_DATABASE_URL ?? "";
   if (!databaseUrl) throw new Error("Set RESTORE_DATABASE_URL to the throwaway Postgres in this runner.");
@@ -1256,6 +1290,10 @@ async function main() {
     await runAuthCount(args[0], args[1]);
     return;
   }
+  if (command === "storage-check" && args.length === 3) {
+    await runStorageCheck(args[0], args[1], args[2]);
+    return;
+  }
   if (command === "auth-verify" && args.length === 2) {
     await runAuthVerify(args[0], args[1]);
     return;
@@ -1264,7 +1302,7 @@ async function main() {
     runPostgisPlan(args[0], args[1], args[2], args[3], args[4]);
     return;
   }
-  process.stderr.write("usage: restore-list.mjs drop-sql|filter|classify|sample|skipped-count|auth-count|auth-verify|postgis-plan\n");
+  process.stderr.write("usage: restore-list.mjs drop-sql|filter|classify|sample|skipped-count|auth-count|storage-check|auth-verify|postgis-plan\n");
   process.exitCode = 1;
 }
 

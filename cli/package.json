@@ -1,0 +1,29 @@
+{
+  "name": "lastgood",
+  "version": "0.1.1",
+  "description": "Open a LastGood backup copy on your own computer, checked against the SHA-256 its backup recorded.",
+  "license": "UNLICENSED",
+  "homepage": "https://lastgood.app",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/geebaggee/lastgood.git",
+    "directory": "cli"
+  },
+  "type": "module",
+  "bin": {
+    "lastgood": "bin/lastgood.mjs"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "@scure/base": "2.4.0",
+    "age-encryption": "0.3.1",
+    "shamir-secret-sharing": "0.0.4"
+  }
+}

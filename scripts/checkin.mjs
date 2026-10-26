@@ -9,9 +9,10 @@ if (!secret) {
 }
 
 const kind = process.env.LIFEBOAT_KIND === "restore-test" ? "restore-test" : "backup";
+const ok = process.env.LIFEBOAT_OK === "true";
 const body = JSON.stringify({
   version: 1,
-  ok: process.env.LIFEBOAT_OK === "true",
+  ok,
   kind,
   project: (process.env.LIFEBOAT_PROJECT || "").slice(0, 80),
   startedAt: process.env.LIFEBOAT_STARTED_AT || null,
@@ -57,23 +58,7 @@ const body = JSON.stringify({
   error: process.env.LIFEBOAT_ERROR ? process.env.LIFEBOAT_ERROR.slice(0, 300) : null,
 });
 
-const timestamp = String(Math.floor(Date.now() / 1000));
-const response = await fetch(url, {
-  method: "POST",
-  headers: {
-    "Content-Type": "application/json",
-    "User-Agent": "LastGood-lifeboat/0.1 (+https://lastgood.app)",
-    "X-LastGood-Timestamp": timestamp,
-    "X-LastGood-Signature": signCheckin(secret, timestamp, body),
-  },
-  body,
-});
-
-if (!response.ok) {
-  const text = (await response.text()).slice(0, 180);
-  console.error(`Check-in failed (${response.status}). ${text}`);
-  process.exit(1);
-}
+const response = await sendWithRetries();
 console.log(`Check-in accepted (${response.status}).`);
 const answer = await response.json().catch(() => null);
 const copies = answer && typeof answer === "object" ? answer.copies : null;
@@ -121,4 +106,54 @@ function copiesFile(file) {
       const [key, bytes, sha256, versionId] = line.split("\t");
       return { key, bytes: Number(bytes), sha256, versionId: versionId || null };
     });
+}
+
+/**
+ * What a run that worked should say when only its check-in failed, so a red run in the middle of a LastGood outage
+ * doesn't read as a failed backup. Without the check-in LastGood has no checksum record of tonight's copies (D18).
+ */
+function afterFailedCheckin(runKind) {
+  return runKind === "restore-test"
+    ? "The test restore itself passed. LastGood has no record of it, so your login won't show tonight's result."
+    : "The backup itself finished and tonight's copies were uploaded. LastGood has no checksum record of them, so your login's Open here won't open tonight's copies (the lastgood CLI can, with --unchecked). Earlier nights aren't affected, and the next run checks in as usual.";
+}
+
+/**
+ * Posts the check-in, trying twice more when LastGood or the network fails on its side (no answer, 408, 429 or 5xx),
+ * so a blip doesn't turn a good backup red or leave its copies unrecorded (D18). A refusal (401, 400) is final. Each
+ * try is signed afresh, since the signature carries its time. Under two minutes at most, waits included.
+ */
+async function sendWithRetries() {
+  const waitMs = Number(process.env.LIFEBOAT_CHECKIN_WAIT_MS ?? "") || 5000;
+  const waits = [waitMs, 3 * waitMs];
+  for (let attempt = 0; ; attempt += 1) {
+    let response = null;
+    let problem;
+    try {
+      const timestamp = String(Math.floor(Date.now() / 1000));
+      response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": "LastGood-lifeboat/0.1 (+https://lastgood.app)",
+          "X-LastGood-Timestamp": timestamp,
+          "X-LastGood-Signature": signCheckin(secret, timestamp, body),
+        },
+        body,
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (response.ok) return response;
+      problem = `(${response.status}). ${(await response.text()).slice(0, 180)}`;
+    } catch (error) {
+      problem = error?.name === "TimeoutError" ? "(no answer within 30 seconds)." : "(LastGood could not be reached).";
+    }
+    const again = attempt < waits.length && (!response || response.status === 408 || response.status === 429 || response.status >= 500);
+    if (!again) {
+      console.error(`Check-in failed ${problem}`.trim());
+      if (ok) console.error(afterFailedCheckin(kind));
+      process.exit(1);
+    }
+    console.log(`Check-in failed ${problem.trim()} Trying again in ${Math.round(waits[attempt] / 1000)} s.`);
+    await new Promise((resolve) => setTimeout(resolve, waits[attempt]));
+  }
 }
