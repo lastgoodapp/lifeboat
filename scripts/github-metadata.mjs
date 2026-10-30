@@ -15,6 +15,8 @@ const ATTEMPTS = 3;
  * run, on the repository's Actions minutes; with it the call is tried again like a dropped connection.
  */
 export const CALL_TIMEOUT_MS = 60_000;
+/** The longest wait a Retry-After gets, as in storage-copy.mjs. A longer one stops the copy for the next run. */
+const MAX_WAIT_MS = 60_000;
 
 /** What goes in the folder. Issues include pull requests, as GitHub lists them; pulls.json adds branch details. */
 export const LISTS = [
@@ -38,10 +40,21 @@ export function nextLink(header) {
   return null;
 }
 
+/** GitHub's own rate limits: 429, or 403 with a message that says so (its secondary limits). */
+function rateLimited(status, body) {
+  return status === 429 || (status === 403 && /rate limit/i.test(typeof body?.message === "string" ? body.message : ""));
+}
+
+/** GitHub's Retry-After, up to a minute, or one, two, four seconds when it gives none. */
+function waitFor(response, attempt) {
+  const raw = Number(response.headers.get("retry-after"));
+  if (Number.isFinite(raw) && raw > 0) return Math.min(raw * 1000, MAX_WAIT_MS);
+  return 1000 * 2 ** (attempt - 1);
+}
+
 function explain(status, body, what) {
-  const message = typeof body?.message === "string" ? body.message : "";
   if (status === 401) return "GitHub did not accept the workflow's token.";
-  if (status === 403 && /rate limit/i.test(message)) {
+  if (rateLimited(status, body)) {
     return `GitHub's rate limit stopped the copy of ${what}. The next run tries again.`;
   }
   if (status === 403 || status === 404) {
@@ -69,7 +82,16 @@ async function getJson(url, { token, fetchImpl, sleep, what }) {
       if (attempt < ATTEMPTS) await sleep(1000 * 2 ** (attempt - 1));
       continue;
     }
-    if (response.ok) return { body: await response.json(), next: nextLink(response.headers.get("link")) };
+    if (response.ok) {
+      // The body can still be cut off, or stall past the timeout, after the status arrives: try again as above.
+      try {
+        return { body: await response.json(), next: nextLink(response.headers.get("link")) };
+      } catch {
+        last = `GitHub's answer was cut off when reading ${what}.`;
+        if (attempt < ATTEMPTS) await sleep(1000 * 2 ** (attempt - 1));
+        continue;
+      }
+    }
     let body = null;
     try {
       body = await response.json();
@@ -79,8 +101,9 @@ async function getJson(url, { token, fetchImpl, sleep, what }) {
     // Issues switched off in the repository's settings: there are none to copy.
     if (response.status === 410) return { body: [], next: null, gone: true };
     last = explain(response.status, body, what);
-    if (response.status < 500 && response.status !== 429) break;
-    if (attempt < ATTEMPTS) await sleep(1000 * 2 ** (attempt - 1));
+    if (response.status < 500 && !rateLimited(response.status, body)) break;
+    // Retried after 1 and 2 seconds whatever GitHub asked, a secondary rate limit failed all three tries.
+    if (attempt < ATTEMPTS) await sleep(waitFor(response, attempt));
   }
   throw new MetadataError(last ?? `GitHub did not answer when reading ${what}.`);
 }
@@ -116,15 +139,52 @@ export async function exportMetadata({ api, repository, token, dir, fetchImpl = 
   const repo = await getJson(base, { ...deps, what: "the repository" });
   writeFileSync(path.join(dir, "repository.json"), JSON.stringify(repo.body));
   const counts = { issues: 0, pullRequests: 0, comments: 0 };
+  let pulls = [];
+  let commentsGone = false;
   for (const list of LISTS) {
     const { items, gone } = await readList(base, list, deps);
+    if (gone && list.file === "issue-comments.json") {
+      // GitHub keeps pull requests' conversation comments with the issues' comments. With Issues switched off they are
+      // read one pull request at a time below, so the night cannot read as good with them missing.
+      commentsGone = true;
+      continue;
+    }
     if (gone && list.issues) note(`Issues are switched off for ${repository}, so ${list.file} is empty.`);
     writeFileSync(path.join(dir, list.file), JSON.stringify(items));
     if (list.file === "issues.json") counts.issues = items.filter((item) => !item?.pull_request).length;
-    if (list.file === "pulls.json") counts.pullRequests = items.length;
+    if (list.file === "pulls.json") {
+      counts.pullRequests = items.length;
+      pulls = items;
+    }
     if (list.file.endsWith("comments.json")) counts.comments += items.length;
   }
+  if (commentsGone) {
+    const comments = await pullRequestComments(base, pulls, deps, repository);
+    note(
+      pulls.length > 0
+        ? `Issues are switched off for ${repository}, so the pull requests' conversation comments were read one pull request at a time.`
+        : `Issues are switched off for ${repository}, so issue-comments.json is empty.`,
+    );
+    writeFileSync(path.join(dir, "issue-comments.json"), JSON.stringify(comments));
+    counts.comments += comments.length;
+  }
   return counts;
+}
+
+/** Each pull request's conversation comments, read from its own list when the repository-wide one answers 410. */
+async function pullRequestComments(base, pulls, deps, repository) {
+  const comments = [];
+  for (const pull of pulls) {
+    if (!Number.isInteger(pull?.number)) continue;
+    const { items, gone } = await readList(base, { file: "issue-comments.json", path: `issues/${pull.number}/comments`, query: {} }, deps);
+    if (gone) {
+      throw new MetadataError(
+        `The pull requests' conversation comments could not be copied: Issues is switched off for ${repository}, and GitHub keeps those comments under Issues.`,
+      );
+    }
+    comments.push(...items);
+  }
+  return comments;
 }
 
 /** The counts for a folder `exportMetadata` wrote, read back the way a restore reads them. Throws if any file is missing or damaged. */

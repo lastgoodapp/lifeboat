@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { storageObjectCount, storageShortfall } from "../scripts/restore-list.mjs";
+import { copiedStorageNames, decodeCopyField, stillThereSql, storageObjectCount, storageObjectNames, storageShortfall } from "../scripts/restore-list.mjs";
 import { copyStorage, parseLogin, safeSegment } from "../scripts/storage-copy.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
@@ -26,9 +26,11 @@ const FILES = {
 
 /**
  * A fake Supabase project: Auth's token endpoint and the Storage API's bucket list, file list and authenticated
- * download, enough to copy with. Records every request, and refuses an access token it has retired.
+ * download, enough to copy with. Records every request, and refuses an access token it has retired. Each route in
+ * `failFirst` is answered with `failStatus` that many times before it works, with `retryAfter` as its Retry-After when
+ * given.
  */
-async function fakeSupabase({ files = FILES, expiresIn = 3600, failFirst = {}, retireAfter = Infinity, names = null, emailOff = false, forbid = null } = {}) {
+async function fakeSupabase({ files = FILES, expiresIn = 3600, failFirst = {}, failStatus = 503, retryAfter = null, retireAfter = Infinity, names = null, emailOff = false, forbid = null } = {}) {
   const requests = [];
   const live = new Map();
   const refresh = new Set();
@@ -47,8 +49,8 @@ async function fakeSupabase({ files = FILES, expiresIn = 3600, failFirst = {}, r
     request.on("data", (chunk) => (body += chunk));
     request.on("end", () => {
       const url = new URL(request.url, "http://localhost");
-      const send = (status, value, type = "application/json") => {
-        response.writeHead(status, { "content-type": type });
+      const send = (status, value, type = "application/json", headers = {}) => {
+        response.writeHead(status, { "content-type": type, ...headers });
         response.end(type === "application/json" ? JSON.stringify(value) : value);
       };
       if (url.pathname === "/checkin") {
@@ -59,7 +61,7 @@ async function fakeSupabase({ files = FILES, expiresIn = 3600, failFirst = {}, r
       const key = `${request.method} ${url.pathname}`;
       if (failFirst[key] > 0) {
         failFirst[key] -= 1;
-        return send(503, { message: "busy" });
+        return send(failStatus, { message: "busy" }, "application/json", retryAfter === null ? {} : { "retry-after": retryAfter });
       }
       if (request.headers.apikey !== APIKEY) return send(401, { message: "Invalid API key" });
       if (url.pathname === "/auth/v1/token" && request.method === "POST") {
@@ -175,6 +177,74 @@ test("a busy answer is tried again", async () => {
   assert.equal(requests.filter((request) => request.path === "/storage/v1/bucket").length, 3);
 });
 
+/** Copies against a fake that answers `route` with `status` the first `times` times, and counts how often it was asked. */
+async function failing(route, status, times) {
+  const fake = await fakeSupabase({ failFirst: { [route]: times }, failStatus: status });
+  const dir = mkdtempSync(path.join(tmpdir(), "lg-storage-"));
+  try {
+    const result = await copyStorage({ ref: REF, login: LOGIN, apikey: APIKEY, dir, api: fake.api, sleep: noSleep }).then(
+      (counts) => ({ counts }),
+      (error) => ({ error }),
+    );
+    return { ...result, asked: fake.requests.filter((request) => `${request.method} ${request.path}` === route).length };
+  } finally {
+    fake.server.close();
+  }
+}
+
+test("a rate limit's Retry-After is waited out up to a minute, and without a number of seconds each wait doubles", async () => {
+  const waited = async (retryAfter) => {
+    const fake = await fakeSupabase({ failFirst: { "GET /storage/v1/bucket": 2 }, failStatus: 429, retryAfter });
+    const waits = [];
+    try {
+      const counts = await copyStorage({ ref: REF, login: LOGIN, apikey: APIKEY, dir: mkdtempSync(path.join(tmpdir(), "lg-storage-")), api: fake.api, sleep: async (ms) => waits.push(ms) });
+      assert.equal(counts.files, 7);
+      return waits;
+    } finally {
+      fake.server.close();
+    }
+  };
+  assert.deepEqual(await waited("5"), [5000, 5000]);
+  assert.deepEqual(await waited("3600"), [60_000, 60_000], "capped at a minute");
+  assert.deepEqual(await waited(null), [1000, 2000]);
+  assert.deepEqual(await waited("0"), [1000, 2000]);
+  assert.deepEqual(await waited("Wed, 28 Oct 2026 08:00:00 GMT"), [1000, 2000], "a date is not a number of seconds");
+});
+
+test("a rate limit is tried again and named when it lasts, and a file Supabase does not have is not asked for again", async () => {
+  const once = await failing("GET /storage/v1/bucket", 429, 1);
+  assert.equal(once.counts?.files, 7, once.error?.message);
+  assert.equal(once.asked, 2);
+
+  const lasting = await failing("GET /storage/v1/bucket", 429, 99);
+  assert.match(lasting.error?.message ?? "", /^Supabase's rate limit stopped the copy of the list of buckets\. The next run tries again\.$/);
+  assert.equal(lasting.asked, 3);
+
+  const gone = await failing("GET /storage/v1/object/authenticated/avatars/top.txt", 404, 99);
+  assert.equal(gone.error?.message, "Supabase could not find a file in avatars. It may have been deleted during the copy; the next run tries again.");
+  assert.equal(gone.asked, 1);
+
+  const noList = await failing("GET /storage/v1/bucket", 404, 99);
+  assert.equal(noList.error?.message, "Supabase could not find the list of buckets. It may have been deleted during the copy; the next run tries again.");
+  assert.equal(noList.asked, 1);
+});
+
+test("a session that says it lasts zero seconds is taken to last an hour, not renewed before every request", async () => {
+  const { counts, requests } = await copied({}, { expiresIn: 0 });
+  assert.equal(counts.files, 7);
+  assert.deepEqual(
+    requests.filter((request) => request.grant).map((request) => request.grant),
+    ["password"],
+  );
+});
+
+test("a storage login needs an email and a password, split at the last colon", () => {
+  assert.deepEqual(parseLogin(`  ${LOGIN}\n`), { email: EMAIL, password: PASSWORD });
+  for (const value of [`${EMAIL}:`, `no-at-sign:${PASSWORD}`, `:${PASSWORD}`, "", undefined]) {
+    assert.throws(() => parseLogin(value), /LIFEBOAT_STORAGE_LOGIN is not a storage login/, String(value));
+  }
+});
+
 test("a wrong password, a wrong key or a secret key each say what to do, and never print the password", async () => {
   await assert.rejects(copied({ login: `${EMAIL}:WrongPassword0000000000000000000` }), (error) => {
     assert.match(error.message, /did not accept the storage login in LIFEBOAT_STORAGE_LOGIN\. If email sign-in is turned off for this project, that is the likely cause/);
@@ -224,19 +294,40 @@ test("a file name that would leave its folder stops the copy before anything is 
 });
 
 // The whole backup, with fake tools, a fake bucket and a fake Supabase project on a local port.
-/** pg_restore for a dump whose storage.objects holds `rows` files: its TOC line, and the rows when asked for them. */
-function pgRestoreWithObjects(rows) {
+/**
+ * pg_restore for a dump whose storage.objects holds `rows` files: its TOC line, and the rows when asked for them. The
+ * first `real` rows are files the fake project serves, so the copy holds them; the rest are in bucket b, which it doesn't.
+ */
+function pgRestoreWithObjects(rows, real = 7) {
+  const served = Object.entries(FILES).flatMap(([bucket, files]) => Object.keys(files).map((name) => `${bucket}\t${name}`));
+  const lines = Array.from({ length: rows }, (_, i) => `id${i}\t${i < real ? served[i] : `b\tn${i}`}`);
   return `#!/bin/sh
 case " $* " in
   *" --list "*) echo "4300; 0 17700 TABLE DATA storage objects supabase_storage_admin" ;;
   *" -t objects "*)
     echo "COPY storage.objects (id, bucket_id, name) FROM stdin;"
-    i=0
-    while [ $i -lt ${rows} ]; do printf 'id%s\tb\tn%s\n' "$i" "$i"; i=$((i + 1)); done
+    cat <<'ROWS'
+${lines.join("\n")}
+ROWS
     printf '%s\n' '\\.'
     ;;
 esac
 exit 0
+`;
+}
+
+/** psql that answers the files check with `answer`, or fails with `status`, and keeps the query it was given. */
+function psqlAnswering(answer, status = 0) {
+  return (dir) => `#!/bin/sh
+echo "$*" >> "${dir}/psql.log"
+for arg; do
+  if [ "$prev" = "--file" ]; then cat "$arg" > "${dir}/psql.sql"; fi
+  prev="$arg"
+done
+case " $* " in
+  *" --file "*) [ ${status} -eq 0 ] && printf '%s\n' '${answer}'; exit ${status} ;;
+esac
+exit 2
 `;
 }
 
@@ -250,6 +341,14 @@ function fakeTools(dir, tools = {}) {
 echo "$*" >> "${dir}/aws.log"
 case " $* " in
   *" s3api "*) printf '%s\\n' '{"Contents":[]}' ;;
+  *" s3 ls "*) echo "2024-01-01 00:00:00 media" ;;
+  *" s3 sync s3://"*)
+    # A download from the project's own S3 endpoint: one file, dated when it last changed there, years ago.
+    for last; do :; done
+    mkdir -p "$last/2024"
+    printf 'unchanged' > "$last/2024/a.png"
+    touch -d '2001-02-03 04:05:06' "$last/2024/a.png"
+    ;;
   *" s3 cp "*)
     for last; do :; done
     prev=""; src=""
@@ -264,6 +363,7 @@ case " $* " in
     prev=""; src=""
     for arg in "$@"; do [ "$arg" = "$last" ] && src="$prev"; prev="$arg"; done
     key="\${last#s3://*/}"
+    find "$src" -type f -exec stat -c '%Y %n' {} + >> "${dir}/sync-times.log"
     mkdir -p "${uploads}/$key"
     cp -R "$src"/. "${uploads}/$key"
     ;;
@@ -272,7 +372,8 @@ exit 0
 `,
   );
   writeFileSync(path.join(dir, "pg_restore"), tools.pgRestore ?? "#!/bin/sh\nexit 0\n");
-  for (const tool of ["pg_dump", "aws", "pg_restore"]) chmodSync(path.join(dir, tool), 0o755);
+  writeFileSync(path.join(dir, "psql"), (tools.psql ?? psqlAnswering("", 2))(dir));
+  for (const tool of ["pg_dump", "aws", "pg_restore", "psql"]) chmodSync(path.join(dir, tool), 0o755);
   if (tools.age) {
     writeFileSync(path.join(dir, "age"), tools.age);
     chmodSync(path.join(dir, "age"), 0o755);
@@ -310,7 +411,7 @@ async function backupWithStorage(extra = {}, fake = {}, tools = {}) {
           LIFEBOAT_STORAGE_LOGIN: LOGIN,
           SUPABASE_PUBLISHABLE_KEY: APIKEY,
           SUPABASE_URL: supabase.api,
-          ...extra,
+          ...(typeof extra === "function" ? extra(supabase.api) : extra),
         },
       });
       let stdout = "";
@@ -392,6 +493,36 @@ test("with encryption off the files go up bucket by bucket, as the S3 path alway
   assert.equal(existsSync(path.join(run.work, "storage")), false);
 });
 
+test("with encryption off, a bucket whose name starts with a dot goes up too", async () => {
+  const run = await backupWithStorage(
+    { LIFEBOAT_ENCRYPT: "false", LIFEBOAT_PUBLIC_KEY: "" },
+    { files: { avatars: { "top.txt": "at the top" }, ".private": { "kept.txt": "in a dot bucket" } } },
+  );
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(readFileSync(path.join(run.uploads, "lifeboat", "storage", "avatars", "top.txt"), "utf8"), "at the top");
+  assert.equal(readFileSync(path.join(run.uploads, "lifeboat", "storage", ".private", "kept.txt"), "utf8"), "in a dot bucket");
+});
+
+test("files read with S3 keys go up dated now, so an unchanged one is never old enough for retention to delete", async () => {
+  // aws s3 sync dates a download with when it last changed at the source. Uploaded as dated, a file nobody changed was
+  // never sent again, so its copy kept its first date and retention deleted it after RETENTION_DAYS.
+  const started = Math.floor(Date.now() / 1000) - 60;
+  const run = await backupWithStorage({
+    LIFEBOAT_ENCRYPT: "false",
+    LIFEBOAT_PUBLIC_KEY: "",
+    LIFEBOAT_STORAGE_LOGIN: "",
+    STORAGE_S3_ENDPOINT: "https://abcdefghijklmnopqrst.storage.supabase.co/storage/v1/s3",
+    STORAGE_S3_ACCESS_KEY_ID: "unit-test-storage-key-id",
+    STORAGE_S3_SECRET_ACCESS_KEY: "unit-test-storage-secret-not-real",
+  });
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(run.checkins[0].storageSource, "s3");
+  assert.equal(readFileSync(path.join(run.uploads, "lifeboat", "storage", "media", "2024", "a.png"), "utf8"), "unchanged");
+  const sent = readFileSync(path.join(run.dir, "sync-times.log"), "utf8").trim().split("\n");
+  assert.equal(sent.length, 1);
+  assert.ok(Number(sent[0].split(" ")[0]) >= started, `uploaded dated ${sent[0]}`);
+});
+
 test("without the storage login the files are skipped and the log says how to add them", async () => {
   const run = await backupWithStorage({ LIFEBOAT_STORAGE_LOGIN: "" });
   assert.equal(run.status, 0, run.stderr);
@@ -412,6 +543,41 @@ test("a login Supabase refuses fails the run by name, after the other copies, an
   assert.doesNotMatch(readFileSync(path.join(run.dir, "aws.log"), "utf8"), /list-objects-v2|s3 rm /, "retention did not run");
   assert.equal(run.checkins[0].ok, false);
   assert.match(run.checkins[0].error, /did not accept the storage login/);
+});
+
+test("when several parts fail, the night's error names every one first, so the check-in's 300 characters keep them all", async () => {
+  // The storage login, the Supabase token and the Vercel token all refused: three parts fail on one night.
+  const run = await backupWithStorage((api) => ({
+    LIFEBOAT_STORAGE_LOGIN: `${EMAIL}:WrongPassword0000000000000000000`,
+    LIFEBOAT_SUPABASE_TOKEN: `sbp_${"0".repeat(40)}`,
+    SUPABASE_API_URL: api,
+    LIFEBOAT_VERCEL_TOKEN: "unit-test-vercel-token-not-real",
+    VERCEL_PROJECT_ID: "prj_unittest",
+    VERCEL_API_URL: api,
+  }));
+  assert.notEqual(run.status, 0);
+  const { error } = run.checkins[0];
+  assert.match(error, /^3 parts failed: files, Supabase setup and Vercel\. Supabase did not accept the storage login/);
+  assert.equal(error.length, 300, "the reasons run past what the check-in keeps; the names still came first");
+  // The job log keeps every reason in full.
+  for (const reason of [/did not accept the storage login/, /did not accept LIFEBOAT_SUPABASE_TOKEN/, /Vercel did not accept LIFEBOAT_VERCEL_TOKEN/]) {
+    assert.match(run.stderr, reason);
+  }
+});
+
+test("a users check that fails after a part failed counts as one of the failed parts, named first", async () => {
+  // auth.users is in the dump without its rows, and the storage login is refused.
+  const pgRestore = '#!/bin/sh\ncase " $* " in\n  *" --list "*) echo "200; 1259 17000 TABLE auth users supabase_auth_admin" ;;\nesac\nexit 0\n';
+  const run = await backupWithStorage({ LIFEBOAT_STORAGE_LOGIN: `${EMAIL}:WrongPassword0000000000000000000` }, {}, { pgRestore });
+  assert.notEqual(run.status, 0);
+  assert.match(run.checkins[0].error, /^2 parts failed: users check and files\. The dump has the auth\.users table but none of its rows/);
+  assert.match(run.stderr, /none of its rows.*Supabase did not accept the storage login/);
+});
+
+test("one failed part is named by its reason alone, as before", async () => {
+  const run = await backupWithStorage({ LIFEBOAT_STORAGE_LOGIN: `${EMAIL}:WrongPassword0000000000000000000` });
+  assert.notEqual(run.status, 0);
+  assert.match(run.checkins[0].error, /^Supabase did not accept the storage login/);
 });
 
 test("the dump's storage.objects rows are counted, and a short copy reads as hidden only when it is clearly short", async () => {
@@ -438,6 +604,50 @@ test("the dump's storage.objects rows are counted, and a short copy reads as hid
   assert.deepEqual(storageShortfall(1000, 950), { state: "hidden", missing: 50 });
 });
 
+test("the dump's file names come out whole: escapes undone, a character split across output chunks kept, nulls left out", async () => {
+  const rows = "COPY storage.objects (id, bucket_id, name, owner) FROM stdin;\n1\tdocs\tcaf\u00e9.pdf\t\\N\n2\tdocs\ttab\\there\t\\N\n3\tdocs\t\\N\t\\N\n\\.\n";
+  const bytes = Buffer.from(rows);
+  const split = bytes.indexOf(0xc3) + 1; // between the two bytes of é
+  const spawnImpl = () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    setImmediate(() => {
+      child.stdout.emit("data", bytes.subarray(0, split));
+      child.stdout.emit("data", bytes.subarray(split));
+      child.emit("close", 0);
+    });
+    return child;
+  };
+  const toc = "4300; 0 17700 TABLE DATA storage objects supabase_storage_admin\n";
+  assert.deepEqual([...(await storageObjectNames({ toc, dumpPath: "d", pgRestore: "pg_restore", spawnImpl }))], ["docs/caf\u00e9.pdf", "docs/tab\there"]);
+  assert.equal(await storageObjectNames({ toc: "4268; 0 17467 TABLE DATA public notes postgres\n", dumpPath: "d", pgRestore: "pg_restore", spawnImpl }), null);
+  assert.equal(decodeCopyField("a\\\\b\\nc\\011d"), "a\\b\nc\td");
+  assert.equal(decodeCopyField("\\N"), null);
+});
+
+test("the copy's names are its folders and files, one folder per bucket", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "lifeboat-copied-names-"));
+  try {
+    mkdirSync(path.join(root, "avatars", "a", "deep"), { recursive: true });
+    mkdirSync(path.join(root, "empty"));
+    writeFileSync(path.join(root, "avatars", "a", "deep", "2.png"), "x");
+    writeFileSync(path.join(root, "avatars", "top.txt"), "x");
+    assert.deepEqual([...copiedStorageNames(root)].sort(), ["avatars/a/deep/2.png", "avatars/top.txt"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the files query is read only and carries the names as one dollar-quoted value, whatever they hold", () => {
+  const sql = stillThereSql(["docs/x$lastgood$y 'q'.pdf", "avatars/a/1.png"]);
+  assert.match(sql, /^START TRANSACTION READ ONLY;\nSET LOCAL statement_timeout = '60s';\n/);
+  assert.match(sql, /\nCOMMIT;\n$/);
+  // The name holds $lastgood$, so the quote is a tag the names don't.
+  assert.ok(sql.includes(`$lastgood_$[{"b":"docs","n":"x$lastgood$y 'q'.pdf"},{"b":"avatars","n":"a/1.png"}]$lastgood_$::json`));
+  assert.equal(sql.split("$lastgood_$").length, 3);
+});
+
 test("a copy that matches the dump's files says nothing more, and passes", async () => {
   const run = await backupWithStorage({}, {}, { pgRestore: pgRestoreWithObjects(7) });
   assert.equal(run.status, 0, run.stderr);
@@ -456,8 +666,213 @@ test("a storage policy that hides files from the login fails the run by name, af
   assert.match(run.checkins[0].error, /a storage policy hides 23 from it/);
 });
 
-test("a file or two short of the dump is noted as likely deleted, and the run passes", async () => {
-  const run = await backupWithStorage({}, {}, { pgRestore: pgRestoreWithObjects(8) });
+test("a file the dump lists that the database no longer has was deleted between the two: noted, and the run passes", async () => {
+  const run = await backupWithStorage({}, {}, { pgRestore: pgRestoreWithObjects(8), psql: psqlAnswering("0 ") });
   assert.equal(run.status, 0, run.stderr);
-  assert.match(run.stdout, /Files: the database dump lists 1 file more than the files copy holds, most likely deleted between the two\./);
+  assert.match(run.stdout, /Files: 1 file the database dump listed was deleted before the files copy read it\. The next run copies what is there then\./);
+  assert.equal(run.checkins[0].ok, true);
+});
+
+test("a few files the database still lists, hidden from the login, fail the night however few they are (B5)", async () => {
+  // 1 of 8 is under the 5% the count alone allows for files deleted in between, so only the names show it.
+  const run = await backupWithStorage({}, {}, { pgRestore: pgRestoreWithObjects(8), psql: psqlAnswering("1 b") });
+  assert.notEqual(run.status, 0);
+  assert.match(
+    run.stderr,
+    /The storage login could not see 1 file your database still lists: a storage policy hides it\. .*\(aal2\)\. .*lastgood-backup@lastgood\.invalid.* The files it could read were uploaded\./,
+  );
+  assert.match(run.stdout, /Files your database still lists that the storage login could not see are in: b\./);
+  assert.equal(readdirSync(path.join(run.uploads, "lifeboat", "storage")).length, 1, "the files it read still went up");
+  assert.equal(run.checkins[0].ok, false);
+  assert.match(run.checkins[0].error, /could not see 1 file your database still lists/);
+  assert.doesNotMatch(run.checkins[0].error, /\bb\b.*n7|n7/, "no file name goes to LastGood");
+  // Only the file the copy lacks is asked about, in a read-only transaction against the database being backed up.
+  const sql = readFileSync(path.join(run.dir, "psql.sql"), "utf8");
+  assert.match(sql, /^START TRANSACTION READ ONLY;/);
+  assert.match(sql, /\[\{"b":"b","n":"n7"\}\]/);
+  assert.match(readFileSync(path.join(run.dir, "psql.log"), "utf8"), /postgres:\/\/lastgood_backup\.[a-z]{20}:pw@example\.invalid\/db --no-psqlrc --quiet --tuples-only --no-align --file /);
+});
+
+test("a copy that matches the dump's count but not its names still finds the hidden file", async () => {
+  // 7 rows, 7 files copied: the count alone sees nothing. One row is a file the login never saw.
+  const run = await backupWithStorage({}, {}, { pgRestore: pgRestoreWithObjects(7, 6), psql: psqlAnswering("1 b") });
+  assert.notEqual(run.status, 0);
+  assert.match(run.checkins[0].error, /could not see 1 file your database still lists: a storage policy hides it\./);
+  assert.match(readFileSync(path.join(run.dir, "psql.sql"), "utf8"), /\[\{"b":"b","n":"n6"\}\]/);
+});
+
+test("when the database can't be asked about the missing files, the copy stands, the run passes, and a warning says it can't tell why", async () => {
+  const run = await backupWithStorage({}, {}, { pgRestore: pgRestoreWithObjects(8), psql: psqlAnswering("", 2) });
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(
+    run.stdout,
+    /::warning::Files: the database dump lists 1 file the files copy does not hold, and the database could not be asked whether they are still there, so this run can't tell whether they were deleted between the two or a storage policy hides them from the storage login\. The next run checks again\./,
+  );
+  // Without an answer it never claims the files were deleted.
+  assert.doesNotMatch(run.stdout, /Most likely they were deleted/);
+});
+
+test("a copy that holds every file the dump lists never asks the database", async () => {
+  const run = await backupWithStorage({}, {}, { pgRestore: pgRestoreWithObjects(7), psql: psqlAnswering("1 b") });
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(existsSync(path.join(run.dir, "psql.sql")), false);
+});
+
+test("storage-check takes zero files copied, and refuses a count that isn't a whole number from zero", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "lifeboat-storage-check-"));
+  const toc = path.join(dir, "toc.txt");
+  writeFileSync(toc, ";\n; A dump with no storage.objects rows.\n224; 1259 17467 TABLE public notes postgres\n");
+  const check = (copied) =>
+    execFileSync(process.execPath, [path.join(ROOT, "scripts", "restore-list.mjs"), "storage-check", toc, path.join(dir, "db.backup"), copied], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  try {
+    assert.equal(check("0"), "none\n");
+    for (const copied of ["-1", "1.5", "lots"]) {
+      assert.throws(() => check(copied), (error) => /storage-check needs the number of files copied\./.test(String(error.stderr)), copied);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("each request says what it sends and what it takes: JSON for the sign-in and file lists, anything for a download", async () => {
+  const sent = [];
+  const fetchImpl = (url, init) => {
+    sent.push({ path: new URL(url).pathname, method: init.method ?? "GET", headers: init.headers });
+    return fetch(url, init);
+  };
+  const { counts } = await copied({ fetchImpl });
+  assert.equal(counts.files, 7);
+  const first = (match) => sent.find(match);
+  const signIn = first((request) => request.path === "/auth/v1/token");
+  assert.equal(signIn.headers["Content-Type"], "application/json");
+  assert.equal(signIn.headers.Accept, "application/json");
+  const list = first((request) => request.path.startsWith("/storage/v1/object/list/"));
+  assert.equal(list.headers["Content-Type"], "application/json");
+  assert.equal(list.headers.Accept, "application/json");
+  assert.equal(first((request) => request.path === "/storage/v1/bucket").headers.Accept, "application/json");
+  assert.equal(first((request) => request.path.startsWith("/storage/v1/object/authenticated/")).headers.Accept, "*/*");
+});
+
+test("a refusal's reason is read from its error field when it has no error_code, an answer of JSON null is still a status, and a read refused twice names the key", async () => {
+  const answering = (match, response) => (url, init) => (new URL(url).pathname === match ? Promise.resolve(response()) : fetch(url, init));
+  await assert.rejects(
+    copied({ fetchImpl: answering("/auth/v1/token", () => Response.json({ error: "email_provider_disabled" }, { status: 422 })) }),
+    (error) => /^Supabase refused the storage login because email sign-in is turned off for this project\./.test(error.message),
+  );
+  await assert.rejects(
+    copied({ fetchImpl: answering("/storage/v1/bucket", () => new Response("null", { status: 500, headers: { "content-type": "application/json" } })) }),
+    (error) => error.message === "Supabase answered 500 when reading the list of buckets.",
+  );
+  await assert.rejects(
+    copied({ fetchImpl: answering("/storage/v1/bucket", () => Response.json({ message: "Invalid API key" }, { status: 401 })) }),
+    (error) => /^Supabase did not accept the publishable key in LIFEBOAT_SUPABASE_PUBLISHABLE_KEY\./.test(error.message),
+  );
+});
+
+test("a bucket or file Supabase lists as null stops the copy by name", async () => {
+  const nullBucket = (url, init) => (new URL(url).pathname === "/storage/v1/bucket" ? Promise.resolve(Response.json([null])) : fetch(url, init));
+  await assert.rejects(copied({ fetchImpl: nullBucket }), (error) => error.message === "Supabase listed a bucket whose name cannot be saved as a folder.");
+  await assert.rejects(copied({}, { names: () => [null] }), (error) => error.message === "Supabase listed a file in avatars whose name cannot be saved safely.");
+});
+
+test("a file or folder name too long to save on the runner stops the copy with a sentence that says so", async () => {
+  // 130 characters, which Storage allows, but 256 bytes in UTF-8: one more than a Linux file name can hold.
+  const long = `${"é".repeat(126)}.png`;
+  const tooLong = "A file or folder in avatars has a name too long to save on the runner (over 255 bytes). Shorten it in Supabase Storage so the files copy can include it.";
+  await assert.rejects(copied({}, { files: { avatars: { [long]: "x" } } }), (error) => error.message === tooLong);
+  await assert.rejects(copied({}, { files: { avatars: { [`${"é".repeat(128)}/a.png`]: "x" } } }), (error) => error.message === tooLong);
+
+  const longest = `${"é".repeat(125)}a.png`;
+  assert.equal(Buffer.byteLength(longest), 255);
+  const { counts, dir } = await copied({}, { files: { avatars: { [longest]: "fits" } } });
+  assert.equal(counts.files, 1);
+  assert.equal(readFileSync(path.join(dir, "avatars", longest), "utf8"), "fits");
+});
+
+test("a full disk or a file the runner cannot save stops the copy with a sentence that says so, without trying again", { skip: !existsSync("/dev/full") }, async () => {
+  // /dev/full answers every write with ENOSPC, as a full disk does.
+  const full = mkdtempSync(path.join(tmpdir(), "lg-storage-"));
+  mkdirSync(path.join(full, "avatars"));
+  symlinkSync("/dev/full", path.join(full, "avatars", "top.txt"));
+  const supabase = await fakeSupabase();
+  try {
+    await assert.rejects(
+      copyStorage({ ref: REF, login: LOGIN, apikey: APIKEY, dir: full, api: supabase.api, sleep: noSleep }),
+      (error) => error.message === "The runner ran out of disk while copying the files in avatars.",
+    );
+    const asked = supabase.requests.filter((request) => request.path === "/storage/v1/object/authenticated/avatars/top.txt");
+    assert.equal(asked.length, 1, "a full disk is not a download to try again");
+  } finally {
+    supabase.server.close();
+  }
+
+  // A folder where the file should go: the open fails, and the sentence names the error, not the network.
+  const blocked = mkdtempSync(path.join(tmpdir(), "lg-storage-"));
+  mkdirSync(path.join(blocked, "avatars", "top.txt"), { recursive: true });
+  await assert.rejects(copied({ dir: blocked }), (error) => error.message === "A file in avatars could not be saved on the runner (EISDIR).");
+
+  // A file where a folder should go.
+  const notFolder = mkdtempSync(path.join(tmpdir(), "lg-storage-"));
+  mkdirSync(path.join(notFolder, "avatars"));
+  writeFileSync(path.join(notFolder, "avatars", "a"), "in the way");
+  await assert.rejects(copied({ dir: notFolder }), (error) => /^A file in avatars could not be saved on the runner \((EEXIST|ENOTDIR)\)\.$/.test(error.message));
+});
+
+test("a download Supabase answers with no body is saved as an empty file", async () => {
+  const noBody = (url, init) =>
+    new URL(url).pathname === "/storage/v1/object/authenticated/avatars/top.txt" ? Promise.resolve(new Response(null, { status: 204 })) : fetch(url, init);
+  const { counts, dir } = await copied({ fetchImpl: noBody });
+  assert.equal(counts.files, 7);
+  assert.equal(readFileSync(path.join(dir, "avatars", "top.txt"), "utf8"), "");
+  const bytes = Object.values(FILES).reduce((sum, bucket) => sum + Object.values(bucket).join("").length, 0);
+  assert.equal(counts.bytes, bytes - FILES.avatars["top.txt"].length);
+});
+
+test("without a sleep given, a busy answer waits a second on the clock before Supabase is asked again", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let asked = 0;
+  const fetchImpl = async (url) => {
+    if (new URL(url).pathname === "/auth/v1/token") return Response.json({ access_token: "access-1", refresh_token: "refresh-1", expires_in: 3600 });
+    asked += 1;
+    return asked === 1 ? Response.json({ message: "busy" }, { status: 503 }) : Response.json([]);
+  };
+  const settle = async () => {
+    for (let round = 0; round < 10; round += 1) await new Promise((resolve) => setImmediate(resolve));
+  };
+  const dir = mkdtempSync(path.join(tmpdir(), "lg-storage-"));
+  const copy = copyStorage({ ref: REF, login: LOGIN, apikey: APIKEY, dir, api: "http://127.0.0.1:9", fetchImpl });
+  await settle();
+  assert.equal(asked, 1);
+  t.mock.timers.tick(999);
+  await settle();
+  assert.equal(asked, 1, "not asked again before the second is up");
+  t.mock.timers.tick(1);
+  assert.deepEqual(await copy, { buckets: 0, files: 0, bytes: 0 });
+  assert.equal(asked, 2);
+});
+
+test("storage-copy.mjs prints a plain line, never Node's own error, when the copy fails in an unexpected way", async () => {
+  const fake = await fakeSupabase();
+  const file = path.join(mkdtempSync(path.join(tmpdir(), "lg-storage-")), "not-a-folder");
+  writeFileSync(file, "");
+  try {
+    const result = await new Promise((resolve) => {
+      const child = spawn(process.execPath, [path.join(ROOT, "scripts", "storage-copy.mjs"), path.join(file, "storage")], {
+        env: { PATH: process.env.PATH, SUPABASE_PROJECT_REF: REF, LIFEBOAT_STORAGE_LOGIN: LOGIN, SUPABASE_PUBLISHABLE_KEY: APIKEY, SUPABASE_URL: fake.api },
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk) => (stdout += chunk));
+      child.stderr.on("data", (chunk) => (stderr += chunk));
+      child.on("close", (code) => resolve({ code, stdout, stderr }));
+    });
+    assert.equal(result.code, 1);
+    assert.equal(result.stderr, "The storage copy failed.\n");
+    assert.equal(result.stdout, "");
+  } finally {
+    fake.server.close();
+  }
 });

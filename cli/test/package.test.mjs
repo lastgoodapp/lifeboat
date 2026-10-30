@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { LIFEBOAT_FILES } from "../scripts/sync-lifeboat.mjs";
 
 const CLI = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -72,6 +73,31 @@ describe("the lastgood package (R3, K7)", () => {
       const run = spawnSync(process.execPath, [path.join(dir, "package", "bin", "lastgood.mjs"), "--help"], { encoding: "utf8" });
       assert.equal(run.status, 0, run.stderr);
       assert.match(run.stdout, /^Usage: lastgood restore /);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("copies the action's scripts into lib/lifeboat when run, and only gives its list when imported", () => {
+    // A copy of the script in a folder of its own, beside stand-in scripts, so the repository's files are never touched.
+    const dir = mkdtempSync(path.join(tmpdir(), "lastgood-sync-"));
+    try {
+      const script = path.join(dir, "cli", "scripts", "sync-lifeboat.mjs");
+      mkdirSync(path.dirname(script), { recursive: true });
+      mkdirSync(path.join(dir, "lifeboat", "scripts"), { recursive: true });
+      copyFileSync(path.join(CLI, "scripts", "sync-lifeboat.mjs"), script);
+      for (const name of LIFEBOAT_FILES) writeFileSync(path.join(dir, "lifeboat", "scripts", name), `// ${name}\n`);
+      const run = spawnSync(process.execPath, [script], { cwd: dir, encoding: "utf8" });
+      assert.equal(run.status, 0, run.stderr);
+      assert.equal(run.stdout, `Copied ${LIFEBOAT_FILES.length} scripts into cli/lib/lifeboat/.\n`);
+      for (const name of LIFEBOAT_FILES) assert.equal(readFileSync(path.join(dir, "cli", "lib", "lifeboat", name), "utf8"), `// ${name}\n`);
+      // Imported where there is no script path, as from node -e, it copies nothing and gives the list.
+      rmSync(path.join(dir, "cli", "lib"), { recursive: true });
+      const source = `import { LIFEBOAT_FILES } from ${JSON.stringify(pathToFileURL(script).href)}; process.stdout.write(LIFEBOAT_FILES.join(" "));`;
+      const imported = spawnSync(process.execPath, ["--input-type=module", "-e", source], { cwd: dir, encoding: "utf8" });
+      assert.equal(imported.status, 0, imported.stderr);
+      assert.equal(imported.stdout, LIFEBOAT_FILES.join(" "));
+      assert.equal(existsSync(path.join(dir, "cli", "lib")), false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

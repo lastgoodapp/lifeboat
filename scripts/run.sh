@@ -1,10 +1,44 @@
 #!/usr/bin/env bash
 # Nightly dump, the storage files, the code with its GitHub history and the Supabase setup, or a monthly restore of the database and code into throwaway Postgres and git.
-# pg_dump only reads DATABASE_URL. psql and pg_restore run only against RESTORE_DATABASE_URL.
+# DATABASE_URL is only read: by pg_dump, and by psql for the server's version and, when the files copy misses a file
+# the dump lists, one read-only query for whether it is still there. psql writes only to RESTORE_DATABASE_URL.
 # The dump is encrypted on the runner before upload when encryption is on, which is the default.
 # Secrets are masked and are not printed.
 # An empty string is treated as unset, because GitHub passes "" for a missing variable.
 set -euo pipefail
+
+# A run stopped part way (cancelled, timed out, its runner shut down) must still check in, as stopped. The runner may
+# signal only this process, not what it runs, and bash holds a trap until the command in front of it ends, which a hung
+# pg_dump never does. So this script runs again as a worker in a process group of its own and waits for it. The first
+# signal goes to that whole group: whatever the worker is running stops, and the worker's traps below check in. Later
+# signals, to this process or its group, never reach the worker's check-in. A run nobody stops is the worker's alone.
+if [[ -z "${LIFEBOAT_WORKER:-}" ]]; then
+  worker=""
+  forwarded=""
+  forward() {
+    [[ -z "$forwarded" ]] || return 0
+    forwarded="$1"
+    [[ -z "$worker" ]] || kill -s "$1" -- "-${worker}" 2>/dev/null || true
+  }
+  trap 'forward HUP' HUP
+  trap 'forward INT' INT
+  trap 'forward TERM' TERM
+  set -m
+  LIFEBOAT_WORKER=1 bash "${BASH_SOURCE[0]}" "$@" &
+  worker=$!
+  # A signal before the worker had a process id is sent now.
+  if [[ -n "$forwarded" ]]; then
+    kill -s "$forwarded" -- "-${worker}" 2>/dev/null || true
+  fi
+  status=0
+  wait "$worker" || status=$?
+  # A signal ends that wait early. The worker is still checking in, so wait for its own status.
+  while [[ -n "$forwarded" ]] && kill -0 "$worker" 2>/dev/null; do
+    status=0
+    wait "$worker" || status=$?
+  done
+  exit "$status"
+fi
 
 mask() {
   local value="${1-}"
@@ -75,13 +109,29 @@ MANAGE_RETENTION="$(value_or "${LIFEBOAT_MANAGE_RETENTION:-}" "true")"
 # Off unless the app turns it on (D9).
 MONTHLY_COPIES="$(value_or "${LIFEBOAT_MONTHLY_COPIES:-}" "false")"
 BUCKET="${S3_BUCKET:-}"
+# LastGood's storage keeps monthly copies in a bucket of their own (B14), so its lock and expiry can differ from the night's.
+MONTHLY_BUCKET="${LIFEBOAT_MONTHLY_BUCKET:-}"
 RETENTION_DAYS="${RETENTION_DAYS:-30}"
-WORKDIR="${LIFEBOAT_WORKDIR:-$(mktemp -d)}"
+# A test restore warns when the newest database copy is this old: backups run nightly, so it means missed nights.
+STALE_COPY_HOURS=48
+# The work folder holds the plain database dump (every row, password hashes included) and, part way through a step,
+# the unencrypted setup and Vercel settings. One Lifeboat makes is removed when the run ends; one the caller names is
+# the caller's.
+if [[ -n "${LIFEBOAT_WORKDIR:-}" ]]; then
+  WORKDIR="$LIFEBOAT_WORKDIR"
+  OWN_WORKDIR=false
+else
+  WORKDIR="$(mktemp -d)"
+  OWN_WORKDIR=true
+fi
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 # Each copy this backup uploads, one per line: key, bytes, SHA-256 and version ID. The check-in reports them (D18).
 COPIES_FILE="$WORKDIR/copies.tsv"
 rm -f "$COPIES_FILE"
+# Each copy a test restore downloads, one per line: key and SHA-256. The check-in reports them (D18).
+OPENED_FILE="$WORKDIR/opened.tsv"
+rm -f "$OPENED_FILE"
 
 export AWS_ACCESS_KEY_ID="${S3_ACCESS_KEY_ID:-}"
 export AWS_SECRET_ACCESS_KEY="${S3_SECRET_ACCESS_KEY:-}"
@@ -115,6 +165,7 @@ VERCEL_DOMAINS=""
 VERCEL_DNS_RECORDS=""
 VERCEL_DNS_UNREADABLE=""
 RESTORE_NOT_CHECKED=""
+RESTORE_COPY=""
 PART_ERRORS=""
 LIFEBOAT_ERROR=""
 LIFEBOAT_OK=false
@@ -128,25 +179,55 @@ aws_s3() {
 # match (D18). The hash is of the bytes uploaded, so for an encrypted copy it is of the encrypted file. The version
 # ID is best effort: a bucket without versioning, or keys that cannot read it, leave it out.
 record_copy() {
-  local file="$1" key="$2" bytes sha version
+  local file="$1" key="$2" target="${3:-$BUCKET}" bytes sha version
   bytes="$(wc -c <"$file" | tr -d ' ')"
   sha="$(sha256sum "$file" | awk '{print $1}')"
-  version="$(aws_s3 s3api head-object --bucket "$BUCKET" --key "$key" --query VersionId --output text 2>/dev/null)" || version=""
+  if [[ "$target" == "$BUCKET" ]]; then
+    version="$(aws_s3 s3api head-object --bucket "$BUCKET" --key "$key" --query VersionId --output text 2>/dev/null)" || version=""
+  else
+    # LastGood's monthly bucket: the key can put and list there, never read, so the version comes from a listing.
+    version="$(monthly_head "$target" "$key" 2>/dev/null)" || version=""
+    version="${version#* }"
+  fi
   if [[ ! "$version" =~ ^[A-Za-z0-9._+=/-]{1,200}$ || "$version" == "None" || "$version" == "null" ]]; then
     version=""
   fi
   printf '%s\t%s\t%s\t%s\n' "$key" "$bytes" "$sha" "$version" >>"$COPIES_FILE"
 }
 
+# Records a copy the test restore just downloaded, so the check-in can say which copy it opened and LastGood can match
+# it against the record the backup left (D18). The hash is of the bytes downloaded, as record_copy's is of the bytes
+# uploaded, so for an encrypted copy it is of the encrypted file.
+note_opened() {
+  local key="$1" file="$2" sha
+  sha="$(sha256sum "$file" | awk '{print $1}')"
+  printf '%s\t%s\n' "$key" "$sha" >>"$OPENED_FILE"
+}
+
 # Records a monthly copy made inside the bucket from a copy this backup already recorded. The bytes are the same, so
 # the size and SHA-256 come from that record, once the bucket says the copy is that size. A copy of any other size is
 # removed and never recorded, so the next backup makes it again. The version ID is best effort, as for record_copy.
 record_monthly_copy() {
-  local source="$1" dest="$2" bytes sha head size version
+  local source="$1" dest="$2" target="${3:-$BUCKET}" bytes sha head size version
   read -r bytes sha < <(awk -F '\t' -v key="$source" '$1 == key { print $2, $3; exit }' "$COPIES_FILE") || true
   [[ -n "${bytes:-}" && -n "${sha:-}" ]] || return 0
-  head="$(aws_s3 s3api head-object --bucket "$BUCKET" --key "$dest" --query '[ContentLength,VersionId]' --output text 2>/dev/null)" || head=""
+  if [[ "$target" == "$BUCKET" ]]; then
+    head="$(aws_s3 s3api head-object --bucket "$target" --key "$dest" --query '[ContentLength,VersionId]' --output text 2>/dev/null)" || head=""
+  else
+    # LastGood's monthly bucket: the key can put and list there, never read, so the copy is checked by listing it.
+    head="$(monthly_head "$target" "$dest")" || head=""
+  fi
   read -r size version <<<"$head" || true
+  if [[ "${size:-}" != "$bytes" && "$target" != "$BUCKET" ]]; then
+    fail "The monthly copy of ${source##*/} did not come out at ${bytes} bytes, so it was not recorded. Tonight's copies are in the bucket. Tell hello@lastgood.app: the monthly bucket keeps it under its lock, and this key cannot replace it."
+  fi
+  # Your own bucket did not answer: the copy may be fine, but unchecked it is not recorded, so it goes and is made again.
+  if [[ -z "$head" ]]; then
+    if aws_s3 s3 rm "s3://${BUCKET}/${dest}" >/dev/null 2>&1; then
+      fail "The bucket did not say what size the monthly copy of ${source##*/} came out, so it was removed and not recorded. Tonight's copies are in the bucket, and the next backup makes the monthly copy again."
+    fi
+    fail "The bucket did not say what size the monthly copy of ${source##*/} came out, and it could not be removed. Delete ${dest} so the next backup makes it again. It was not recorded."
+  fi
   if [[ "${size:-}" != "$bytes" ]]; then
     if aws_s3 s3 rm "s3://${BUCKET}/${dest}" >/dev/null 2>&1; then
       fail "The monthly copy of ${source##*/} did not come out at ${bytes} bytes, so it was removed and not recorded. Tonight's copies are in the bucket, and the next backup makes the monthly copy again."
@@ -159,6 +240,56 @@ record_monthly_copy() {
   printf '%s\t%s\t%s\t%s\n' "$dest" "$bytes" "$sha" "$version" >>"$COPIES_FILE"
 }
 
+# "<size> <version>" of the newest version of one key, from a listing: for a bucket this key can list but not read.
+monthly_head() {
+  local target="$1" key="$2" list="$WORKDIR/monthly-head.json"
+  aws_s3 s3api list-object-versions --bucket "$target" --prefix "$key" --output json >"$list" || return 1
+  node --input-type=module -e '
+    import { readFileSync } from "node:fs";
+    const [file, key] = process.argv.slice(1);
+    const text = readFileSync(file, "utf8").trim();
+    const versions = text ? JSON.parse(text).Versions || [] : [];
+    const latest = versions.find((version) => version.Key === key && version.IsLatest);
+    if (!latest) process.exit(3);
+    process.stdout.write(`${latest.Size} ${latest.VersionId || ""}`);
+  ' "$list" "$key"
+}
+
+# Monthly copies this backup made, removed when its check-in never got through. Only the runner that made a copy has a
+# checksum LastGood can trust (D18), so a later night can't report one for it: left in place, it would stay unrecorded
+# for twelve months and open only with --unchecked. Removed, a later good backup this month makes it again from its own
+# copies and records it. After a refusal the copy stays, since the next night would be refused too.
+remove_unrecorded_monthly_copies() {
+  [[ "$MODE" == "backup" && -s "$COPIES_FILE" ]] || return 0
+  local key month="${STAMP:0:6}" last_day=false removed=false
+  # On LastGood's storage they went to the monthly bucket, whose lock keeps them and where this key can't delete.
+  if [[ "$MANAGE_RETENTION" != "true" && -n "$MONTHLY_BUCKET" ]]; then
+    while IFS=$'\t' read -r key _; do
+      [[ "$key" == "${PREFIX}/monthly/"* ]] || continue
+      echo "::warning::The monthly copy ${key} has no record in LastGood. LastGood's monthly bucket keeps it under its lock. It opens only with the lastgood CLI's --unchecked. Tell hello@lastgood.app."
+    done <"$COPIES_FILE"
+    return 0
+  fi
+  # The workflow runs on Ubuntu, whose date reads "+1 day".
+  [[ "$(date -u -d "${STAMP:0:8} +1 day" +%Y%m)" == "$month" ]] || last_day=true
+  while IFS=$'\t' read -r key _; do
+    [[ "$key" == "${PREFIX}/monthly/"* ]] || continue
+    if aws_s3 s3 rm "s3://${BUCKET}/${key}" >/dev/null 2>&1; then
+      removed=true
+      if [[ "$last_day" == true ]]; then
+        echo "Removed the monthly copy ${key}: LastGood has no record of it."
+      else
+        echo "Removed the monthly copy ${key}: LastGood has no record of it. The next good backup this month makes it again."
+      fi
+    else
+      echo "::warning::The monthly copy ${key} has no record in LastGood and could not be removed. Delete it so the next backup makes it again. Until then it opens only with the lastgood CLI's --unchecked."
+    fi
+  done <"$COPIES_FILE"
+  if [[ "$removed" == true && "$last_day" == true ]]; then
+    echo "::warning::Today is the last day of ${month} (UTC), so ${month} has no monthly copy of what was removed. Next month's first good backup makes next month's as usual."
+  fi
+}
+
 fail() {
   LIFEBOAT_ERROR="$1"
   echo "$1" >&2
@@ -166,7 +297,7 @@ fail() {
 }
 
 report() {
-  local status=$?
+  local status=$? checkin=0
   if [[ "$REPORTING" -eq 1 ]]; then
     exit "$status"
   fi
@@ -205,13 +336,35 @@ report() {
     LIFEBOAT_VERCEL_DNS_RECORDS="$VERCEL_DNS_RECORDS" \
     LIFEBOAT_VERCEL_DNS_UNREADABLE="$VERCEL_DNS_UNREADABLE" \
     LIFEBOAT_RESTORE_NOT_CHECKED="$RESTORE_NOT_CHECKED" \
+    LIFEBOAT_RESTORE_COPY="$RESTORE_COPY" \
     LIFEBOAT_COPIES_FILE="$COPIES_FILE" \
+    LIFEBOAT_OPENED_FILE="$OPENED_FILE" \
     LIFEBOAT_ERROR="$LIFEBOAT_ERROR" \
     RETENTION_DAYS="$RETENTION_DAYS" \
-    node "$ROOT/scripts/checkin.mjs" || status=1
+    node "$ROOT/scripts/checkin.mjs" || checkin=$?
+  if [[ "$checkin" -eq 2 ]]; then
+    remove_unrecorded_monthly_copies
+  fi
+  [[ "$checkin" -eq 0 ]] || status=1
+  # A hosted runner is thrown away after the job, but a self-hosted one keeps its disk, and every night's plain dump
+  # with it. The check-in and the monthly copies' removal have read the copies list, so the folder can go.
+  if [[ "$OWN_WORKDIR" == true ]]; then
+    rm -rf "$WORKDIR" || echo "Lifeboat could not remove its work folder ${WORKDIR}." >&2
+  fi
   exit "$status"
 }
 trap report EXIT
+
+# A run stopped part way (cancelled, timed out, its runner shut down) proves nothing. Bash still runs the EXIT trap when
+# a signal ends it, but with the status of the last command that finished, usually 0, so without these the run checked
+# in as passed. Each exits with the shell's usual 128 plus the signal's number, which report turns into a failure.
+stopped() {
+  LIFEBOAT_ERROR="Lifeboat was stopped (SIG$1) before it finished, so this run proves nothing."
+  exit "$2"
+}
+trap 'stopped HUP 129' HUP
+trap 'stopped INT 130' INT
+trap 'stopped TERM 143' TERM
 
 if [[ -n "${DATABASE_URL:-}" && -n "${RESTORE_DATABASE_URL:-}" && "$DATABASE_URL" == "$RESTORE_DATABASE_URL" ]]; then
   fail "Refusing to restore into DATABASE_URL."
@@ -257,6 +410,11 @@ if [[ -n "${DATABASE_URL:-}" ]]; then
     db_user="$(postgres_user "$DATABASE_URL")"
     if [[ ! "$db_user" =~ ^[A-Za-z_][A-Za-z0-9_]*\.[a-z]{20}$ ]]; then
       fail "The Session pooler username must include the project ref, like lastgood_backup.<project-ref>, not the role name alone. Do not use port 6543."
+    fi
+    # The check-in names the app by LIFEBOAT_PROJECT. Connect writes it and DATABASE_URL together, so a URL for another
+    # project means one was changed since, and each night would copy that project under this app's name and read good.
+    if [[ "${LIFEBOAT_PROJECT:-}" =~ ^[a-z]{20}$ && "${db_user##*.}" != "$LIFEBOAT_PROJECT" ]]; then
+      fail "DATABASE_URL signs in to the Supabase project ${db_user##*.}, but this repository backs up ${LIFEBOAT_PROJECT}, so nothing was copied. Connect the repository again from LastGood, or put back the DATABASE_URL it wrote."
     fi
     unset db_user
   fi
@@ -323,6 +481,21 @@ storage_failure_reason() {
       echo "The runner ran out of disk while copying to or from storage." ;;
     *)
       echo "Copying to or from storage failed. Its message is in this run's log in GitHub Actions." ;;
+  esac
+}
+
+# What the check-in says when git cannot clone the repository, picked from git's own message as for aws above. Before,
+# every clone failure said a permission was missing, a GitHub outage or a full disk included.
+code_failure_reason() {
+  case "$1" in
+    *"Authentication failed"*|*"could not read Username"*|*"Repository not found"*|*"does not appear to be a git repository"*|*"returned error: 401"*|*"returned error: 403"*|*"returned error: 404"*)
+      echo "git could not read ${2} with the workflow's token. The workflow needs contents: read under permissions." ;;
+    *"No space left on device"*)
+      echo "The runner ran out of disk while copying the code of ${2}." ;;
+    *"Could not resolve host"*|*"Failed to connect"*|*"Connection timed out"*|*"Connection reset"*|*"early EOF"*|*"RPC failed"*|*"unexpected disconnect"*|*"remote end hung up"*|*"returned error: 5"*)
+      echo "git could not reach GitHub to copy ${2}, or GitHub didn't answer. The next run tries again." ;;
+    *)
+      echo "git could not copy ${2}. Its message is in this run's log in GitHub Actions." ;;
   esac
 }
 
@@ -484,14 +657,45 @@ apply_retention() {
     echo "Retention is left to the bucket. This key does not delete objects."
     return
   fi
-  local list="$WORKDIR/objects.json"
+  local list="$WORKDIR/objects.json" plan="$WORKDIR/retention.plan"
   aws_s3 s3api list-objects-v2 --bucket "$BUCKET" --prefix "${PREFIX}/" --output json >"$list"
+  # Through a file, so a failure is seen: read with < <(...), a retention-days of 0 deleted nothing, night after
+  # night, and the log never said. The night's copies are made by now, so it stays a good night, with a warning.
+  if ! node "$ROOT/scripts/retention.mjs" "$list" "$RETENTION_DAYS" "$PREFIX" >"$plan" 2>"$WORKDIR/retention.err"; then
+    echo "::warning::Nothing was deleted from the bucket. $(tail -n 1 "$WORKDIR/retention.err")"
+    rm -f "$plan" "$WORKDIR/retention.err"
+    return
+  fi
+  rm -f "$WORKDIR/retention.err"
   local key
   while IFS= read -r key; do
     [[ -z "$key" ]] && continue
     aws_s3 s3 rm "s3://${BUCKET}/${key}"
     DELETED_OBJECTS=$((DELETED_OBJECTS + 1))
-  done < <(node "$ROOT/scripts/retention.mjs" "$list" "$RETENTION_DAYS" "$PREFIX")
+  done <"$plan"
+  rm -f "$plan"
+}
+
+# Whether tonight's unencrypted files should be kept for this month's monthly copy: monthly copies are on and kept by
+# this key or LastGood's monthly bucket, and the month has no files copy yet. A listing that fails says no here, and the
+# monthly copy's own listing then fails the night with the reason.
+monthly_files_due() {
+  [[ "$MONTHLY_COPIES" == "true" ]] || return 1
+  local list="$WORKDIR/monthly-storage.json" target="$BUCKET"
+  if [[ "$MANAGE_RETENTION" != "true" ]]; then
+    [[ -n "$MONTHLY_BUCKET" ]] || return 1
+    target="$MONTHLY_BUCKET"
+  fi
+  aws_s3 s3api list-objects-v2 --bucket "$target" --prefix "${PREFIX}/monthly/${STAMP:0:6}/storage/" --max-keys 1 --output json >"$list" 2>/dev/null || {
+    rm -f "$list"
+    return 1
+  }
+  local due=0
+  if grep -q '"Key"' "$list"; then
+    due=1
+  fi
+  rm -f "$list"
+  return "$due"
 }
 
 # Monthly copies (B14, D9). The first good backup of each UTC month is also copied, inside the bucket, to
@@ -501,31 +705,57 @@ make_monthly_copies() {
   if [[ "$MONTHLY_COPIES" != "true" ]]; then
     return
   fi
+  # Own bucket: the copy goes beside the nightly ones and this job's retention keeps it twelve months. LastGood's
+  # storage: the bucket's lifecycle expires every nightly copy at 30 days, so the copy goes to the monthly bucket instead.
+  local target="$BUCKET"
   if [[ "$MANAGE_RETENTION" != "true" ]]; then
-    echo "::warning::Monthly copies are on, but this bucket's own rule decides how long copies are kept, so no monthly copy was made. Set manage-retention to true to keep them for twelve months."
-    return
+    if [[ -z "$MONTHLY_BUCKET" ]]; then
+      echo "::warning::Monthly copies are on, but no monthly copy was made: this bucket's own rule decides how long copies are kept, and no monthly bucket is set. On your own bucket, set manage-retention to true to keep them for twelve months."
+      return
+    fi
+    target="$MONTHLY_BUCKET"
   fi
   [[ -s "$COPIES_FILE" ]] || return 0
-  local month="${STAMP:0:6}" list="$WORKDIR/monthly.json" plan="$WORKDIR/monthly.plan" source dest
-  aws_s3 s3api list-objects-v2 --bucket "$BUCKET" --prefix "${PREFIX}/monthly/${month}/" --output json >"$list"
-  node "$ROOT/scripts/monthly.mjs" "$list" "$COPIES_FILE" "$PREFIX" "$month" >"$plan"
-  if [[ ! -s "$plan" ]]; then
+  local month="${STAMP:0:6}" list="$WORKDIR/monthly.json" plan="$WORKDIR/monthly.plan" source dest err
+  # Either failing used to end the night as "Lifeboat failed with status N", with nothing to say tonight's copies were up.
+  if ! aws_s3 s3api list-objects-v2 --bucket "$target" --prefix "${PREFIX}/monthly/${month}/" --output json >"$list" 2>"$WORKDIR/aws.err"; then
+    err="$(cat "$WORKDIR/aws.err")"
+    rm -f "$WORKDIR/aws.err"
+    [[ -z "$err" ]] || printf '%s\n' "$err" >&2
+    fail "This month's monthly copy was not made: $(storage_failure_reason "$err") Tonight's copies are in the bucket."
+  fi
+  rm -f "$WORKDIR/aws.err"
+  node "$ROOT/scripts/monthly.mjs" "$list" "$COPIES_FILE" "$PREFIX" "$month" >"$plan" ||
+    fail "This month's monthly copy was not made: the bucket's list of monthly copies could not be read. Tonight's copies are in the bucket, and the next backup tries the monthly copy again."
+  if [[ ! -s "$plan" && ! -s "$WORKDIR/monthly-storage.tar" ]]; then
     echo "This month's monthly copy is already in ${PREFIX}/monthly/${month}/."
     return
   fi
   while IFS=$'\t' read -r source dest; do
     [[ -n "$source" && -n "$dest" ]] || continue
-    aws_s3 s3 cp "s3://${BUCKET}/${source}" "s3://${BUCKET}/${dest}" ||
+    aws_s3 s3 cp "s3://${BUCKET}/${source}" "s3://${target}/${dest}" ||
       fail "The monthly copy of ${source##*/} was not made. Tonight's copies are in the bucket, and the next backup tries the monthly copy again."
-    record_monthly_copy "$source" "$dest"
+    record_monthly_copy "$source" "$dest" "$target"
     echo "Monthly copy kept for twelve months: ${dest}"
   done <"$plan"
+  # Unencrypted, the files went up one by one, so their monthly copy is the archive copy_storage kept, uploaded as is.
+  if [[ -s "$WORKDIR/monthly-storage.tar" ]]; then
+    dest="${PREFIX}/monthly/${month}/storage/${STAMP}.tar"
+    aws_s3 s3 cp "$WORKDIR/monthly-storage.tar" "s3://${target}/${dest}" ||
+      fail "The monthly copy of the files was not made. Tonight's copies are in the bucket, and the next backup tries the monthly copy again."
+    record_copy "$WORKDIR/monthly-storage.tar" "$dest" "$target"
+    rm -f "$WORKDIR/monthly-storage.tar"
+    echo "Monthly copy kept for twelve months: ${dest}"
+  fi
 }
 
 # The newest key under <prefix>/<part>/ that ends with one of the suffixes. Keys start with a UTC stamp, so the last one sorted is the newest.
 # Exits 3 when there is none.
 # The newest copy of a part: the last key directly under its folder with one of the suffixes. A key in a folder below,
-# such as a file an unencrypted run synced into storage/<bucket>/, is never a copy.
+# such as a file an unencrypted run synced into storage/<bucket>/, is never a copy. Nor is one named for a time still to
+# come (ten minutes' grace for clocks): it would sort last every month, so each test restore would open it and pass.
+# A name with no time, such as a copy someone kept as keep-before-launch.backup.age, sorts after every dated one too, so
+# it is passed over while a dated copy is there, and used, with a warning, only when none is.
 latest_key() {
   local part="$1"
   shift
@@ -535,18 +765,68 @@ latest_key() {
     import { readFileSync } from "node:fs";
     const [file, folder, ...suffixes] = process.argv.slice(1);
     const payload = JSON.parse(readFileSync(file, "utf8"));
+    const stamp = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z/;
+    const later = [];
+    const untimed = [];
     const keys = (payload.Contents || [])
       .map((item) => item.Key)
       .filter((key) => key && key.startsWith(folder) && !key.slice(folder.length).includes("/"))
-      .filter((key) => suffixes.some((suffix) => key.endsWith(suffix)));
+      .filter((key) => suffixes.some((suffix) => key.endsWith(suffix)))
+      .filter((key) => {
+        const match = stamp.exec(key.slice(folder.length));
+        if (!match) {
+          untimed.push(key);
+          return false;
+        }
+        const [, year, month, day, hour, minute, second] = match.map(Number);
+        if (Date.UTC(year, month - 1, day, hour, minute, second) <= Date.now() + 10 * 60 * 1000) return true;
+        later.push(key.slice(folder.length));
+        return false;
+      });
+    if (later.length > 0) {
+      later.sort();
+      process.stderr.write(`::warning::Left out ${later.length} ${later.length === 1 ? "copy" : "copies"} under ${folder} named for a time still to come, such as ${later[0]}. This workflow never names a copy that way, so the test restore used the newest copy named for a time that has passed.\n`);
+    }
     keys.sort();
-    if (keys.length === 0) process.exit(3);
-    process.stdout.write(keys[keys.length - 1]);
+    untimed.sort();
+    if (keys.length > 0) {
+      if (untimed.length > 0) {
+        process.stderr.write(`::warning::Left out ${untimed.length} ${untimed.length === 1 ? "copy" : "copies"} under ${folder} whose name has no time, such as ${untimed[0].slice(folder.length)}. This workflow names every copy for the time it was made, so the test restore used the newest copy named that way.\n`);
+      }
+      process.stdout.write(keys[keys.length - 1]);
+    } else if (untimed.length > 0) {
+      const name = untimed[untimed.length - 1].slice(folder.length);
+      process.stderr.write(`::warning::No copy under ${folder} is named for the time it was made, so the test restore used ${name}, the last by name. This workflow names every copy for its time, so that copy was put there some other way.\n`);
+      process.stdout.write(untimed[untimed.length - 1]);
+    } else {
+      process.exit(3);
+    }
   ' "$list" "${PREFIX}/${part}/" "$@"
 }
 
 latest_dump_key() {
   latest_key db .backup .backup.enc .backup.age
+}
+
+# Which night the database copy a test restore opens is from, by the time in its name. A pass on an old copy is a pass
+# on that night, not on the data as it is now, so the log says how old it is, and warns when it is older than a missed
+# night or two: no backup since has left a newer one.
+copy_age_note() {
+  node --input-type=module -e '
+    const [name, hours] = process.argv.slice(1);
+    const match = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z/.exec(name);
+    if (!match) {
+      console.log(`Test restore: opening the database copy ${name}. Its name has no time, so its night is not known.`);
+      process.exit(0);
+    }
+    const [, year, month, day, hour, minute, second] = match.map(Number);
+    const ageHours = Math.max(0, Math.floor((Date.now() - Date.UTC(year, month - 1, day, hour, minute, second)) / 3600000));
+    const age = ageHours < 1 ? "less than an hour" : ageHours < 48 ? `${ageHours} ${ageHours === 1 ? "hour" : "hours"}` : `${Math.floor(ageHours / 24)} days`;
+    console.log(`Test restore: opening the newest database copy, ${name}, made ${age} ago.`);
+    if (ageHours >= Number(hours)) {
+      process.stderr.write(`::warning::The newest database copy, ${name}, was made ${age} ago. Backups run every night, so the ones since then left no newer copy. This test restore checks that night\x27s copy, not the data as it is now. Look at the backup runs in this repository\x27s Actions tab.\n`);
+    }
+  ' "$1" "$STALE_COPY_HOURS"
 }
 
 # Supabase Storage files. With the storage login setup made (D4), the workflow signs in through the Storage API and
@@ -563,13 +843,13 @@ copy_storage() {
       local reason
       reason="$(tail -n 1 "$WORKDIR/storage.err")"
       rm -rf "$root" "$WORKDIR/storage.err"
-      part_failed "${reason:-The storage copy failed.} Nothing was uploaded for the files."
+      part_failed files "${reason:-The storage copy failed.} Nothing was uploaded for the files."
       return
     fi
     rm -f "$WORKDIR/storage.err"
     read -r buckets STORAGE_OBJECTS bytes <<<"$counts"
     echo "Files: $(counted "$STORAGE_OBJECTS" file) in $(counted "$buckets" bucket), ${bytes} bytes, read with the storage login."
-    storage_shortfall
+    storage_shortfall "$root"
   elif [[ -n "${STORAGE_S3_ENDPOINT:-}" && -n "${STORAGE_S3_ACCESS_KEY_ID:-}" && -n "${STORAGE_S3_SECRET_ACCESS_KEY:-}" ]]; then
     STORAGE_SOURCE="s3"
     local storage_region="${STORAGE_S3_REGION:-us-east-1}"
@@ -588,6 +868,11 @@ copy_storage() {
         AWS_DEFAULT_REGION="$storage_region" \
         aws --endpoint-url "$STORAGE_S3_ENDPOINT" s3 sync "s3://${name}" "$root/$name"
     done
+    # aws s3 sync dates each file it downloads with the date it was last changed in the project. Unencrypted, the
+    # upload sync below would then skip any file older than its copy in the bucket, so a file nobody changed kept its
+    # first upload's date there and retention deleted it after RETENTION_DAYS, while the nights still read as good.
+    # Dated now, every file goes up each night, as files read with the storage login always have.
+    find "$root" -type f -exec touch {} +
     STORAGE_OBJECTS="$(find "$root" -type f | wc -l | tr -d ' ')"
   else
     STORAGE_SOURCE="none"
@@ -607,31 +892,58 @@ copy_storage() {
     record_copy "$WORKDIR/storage.tar${suffix}" "${PREFIX}/storage/${STAMP}.tar${suffix}"
     rm -f "$WORKDIR/storage.tar${suffix}"
   else
+    # Every bucket folder, one whose name starts with a dot too: a glob would pass it over, and its files, counted in
+    # the copy, would never go up.
     local dest
-    for dest in "$root"/*/; do
-      [[ -d "$dest" ]] || continue
-      s3_copy sync "$dest" "s3://${BUCKET}/${PREFIX}/storage/$(basename "$dest")"
-    done
+    while IFS= read -r -d '' dest; do
+      s3_copy sync "$dest/" "s3://${BUCKET}/${PREFIX}/storage/$(basename "$dest")"
+    done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -print0)
+    # Synced one by one into a folder each night updates, the files leave no copy of tonight for the month to keep. So
+    # while they are on the runner, the month's first night keeps them as one archive, which the monthly copy uploads.
+    if monthly_files_due; then
+      tar -C "$root" -cf "$WORKDIR/monthly-storage.tar" .
+    fi
   fi
   rm -rf "$root" "$WORKDIR/storage.tar"
   if [[ -n "$STORAGE_HIDDEN" ]]; then
-    part_failed "$STORAGE_HIDDEN The files it could read were uploaded."
+    part_failed files "$STORAGE_HIDDEN The files it could read were uploaded."
   fi
 }
 
 # The dump lists every file in storage.objects, read past row level security. A storage policy that hides files from
 # the storage login gives it a short list and no error, so compare (B5). The check needs the dump's rows: without
 # them, or when pg_restore cannot list the dump, it says nothing and the copy stands as it is.
+# A copy far short of the dump is hidden files at once. Otherwise every file the dump lists is looked for in the copy,
+# and the live database is asked, read only, which of the ones not there are still in storage.objects: a file that is
+# still there was hidden, however few of them there are, and one that is gone was deleted between the two.
 STORAGE_HIDDEN=""
 storage_shortfall() {
-  local check state missing dumped
+  local root="$1" check state missing dumped answer still buckets
   "$PG_RESTORE" --list "$WORKDIR/dump.backup" >"$WORKDIR/storage.toc" 2>/dev/null || {
     rm -f "$WORKDIR/storage.toc"
     return 0
   }
-  check="$(LIFEBOAT_PG_RESTORE="$PG_RESTORE" node "$ROOT/scripts/restore-list.mjs" storage-check "$WORKDIR/storage.toc" "$WORKDIR/dump.backup" "$STORAGE_OBJECTS" 2>/dev/null || echo none)"
+  check="$(LIFEBOAT_PG_RESTORE="$PG_RESTORE" node "$ROOT/scripts/restore-list.mjs" storage-check "$WORKDIR/storage.toc" "$WORKDIR/dump.backup" "$STORAGE_OBJECTS" "$root" "$WORKDIR/storage-still.sql" 2>/dev/null || echo none)"
   rm -f "$WORKDIR/storage.toc"
   read -r state missing dumped <<<"$check"
+  if [[ "$state" == ask ]]; then
+    answer="$(PGCLIENTENCODING=UTF8 PGCONNECT_TIMEOUT=30 "$PSQL" "$DATABASE_URL" --no-psqlrc --quiet --tuples-only --no-align --file "$WORKDIR/storage-still.sql" 2>/dev/null || true)"
+    rm -f "$WORKDIR/storage-still.sql"
+    still="${answer%% *}"
+    buckets="${answer#* }"
+    # Without an answer the run can't tell a deleted file from one a storage policy hides, so it does not say which.
+    if [[ ! "$still" =~ ^[0-9]+$ ]]; then
+      echo "::warning::Files: the database dump lists $(counted "$missing" file) the files copy does not hold, and the database could not be asked whether they are still there, so this run can't tell whether they were deleted between the two or a storage policy hides them from the storage login. The next run checks again."
+      return 0
+    fi
+    if [[ "$still" -eq 0 ]]; then
+      echo "Files: $(counted "$missing" file) the database dump listed $([[ "$missing" -eq 1 ]] && echo was || echo were) deleted before the files copy read $([[ "$missing" -eq 1 ]] && echo it || echo them). The next run copies what is there then."
+      return 0
+    fi
+    echo "Files your database still lists that the storage login could not see are in: ${buckets}."
+    STORAGE_HIDDEN="The storage login could not see $(counted "$still" file) your database still lists: a storage policy hides $([[ "$still" -eq 1 ]] && echo it || echo them). A restrictive policy does this, such as one that needs two-factor sign-in (aal2). Change it to leave out the storage login (lastgood-backup@lastgood.invalid), or those files are not in your backups."
+    return 0
+  fi
   case "$state" in
     hidden)
       STORAGE_HIDDEN="The storage login copied $(counted "$STORAGE_OBJECTS" file) of the ${dumped} your database listed a moment earlier, so a storage policy hides ${missing} from it. A restrictive policy does this, such as one that needs two-factor sign-in (aal2). Change it to leave out the storage login (lastgood-backup@lastgood.invalid), or those files are not in your backups."
@@ -652,7 +964,12 @@ count_auth_users() {
   if ! counts="$(LIFEBOAT_PG_RESTORE="$PG_RESTORE" node "$ROOT/scripts/restore-list.mjs" auth-count "$WORKDIR/backup.toc" "$dump" 2>"$WORKDIR/auth.err")"; then
     reason="$(tail -n 1 "$WORKDIR/auth.err")"
     rm -f "$WORKDIR/backup.toc" "$WORKDIR/auth.err"
-    fail "${reason:-The users check failed.} ${PART_ERRORS:-Everything else this run copies was uploaded first.}"
+    if [[ -n "$PART_ERRORS" ]]; then
+      FAILED_PARTS=("users check" "${FAILED_PARTS[@]}")
+      PART_ERRORS="${reason:-The users check failed.} ${PART_ERRORS}"
+      fail "$(part_errors)"
+    fi
+    fail "${reason:-The users check failed.} Everything else this run copies was uploaded first."
   fi
   rm -f "$WORKDIR/backup.toc" "$WORKDIR/auth.err"
   if [[ "$counts" == none ]]; then
@@ -683,16 +1000,33 @@ copy_code() {
   # The token goes in a header set from the environment, never in the URL or on the command line.
   basic="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
   mask "$basic"
-  # A bare clone holds every branch and every tag, including tags on branches that were deleted.
-  if ! GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${basic}" \
-    git clone --bare --quiet "${server}/${repository}.git" "$dir/repo.git"; then
-    fail "git could not read ${repository} with the workflow's token. The workflow needs contents: read under permissions."
+  # A bare clone holds every branch and every tag, including tags on branches that were deleted. A copy that cannot be
+  # made fails the code part only, so the Supabase setup, the Vercel copy and the users check still run tonight.
+  local status=0 err
+  GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${basic}" \
+    git clone --bare --quiet "${server}/${repository}.git" "$dir/repo.git" 2>"$WORKDIR/git.err" || status=$?
+  err="$(cat "$WORKDIR/git.err")"
+  rm -f "$WORKDIR/git.err"
+  [[ -z "$err" ]] || printf '%s\n' "$err" >&2
+  if (( status != 0 )); then
+    rm -rf "$dir"
+    part_failed code "$(code_failure_reason "$err" "$repository") Nothing was uploaded for the code."
+    return
   fi
-  CODE_BRANCHES="$(git -C "$dir/repo.git" for-each-ref --format='%(refname)' refs/heads | wc -l | tr -d ' ')"
-  CODE_TAGS="$(git -C "$dir/repo.git" for-each-ref --format='%(refname)' refs/tags | wc -l | tr -d ' ')"
-  if (( CODE_BRANCHES + CODE_TAGS > 0 )); then
-    git -C "$dir/repo.git" bundle create --quiet "$dir/code.bundle" --all || fail "git could not bundle ${repository}. Nothing was uploaded for the code."
-    git -C "$dir/repo.git" bundle verify --quiet "$dir/code.bundle" >/dev/null || fail "The code bundle did not verify. Nothing was uploaded for the code."
+  local branches tags
+  branches="$(git -C "$dir/repo.git" for-each-ref --format='%(refname)' refs/heads | wc -l | tr -d ' ')"
+  tags="$(git -C "$dir/repo.git" for-each-ref --format='%(refname)' refs/tags | wc -l | tr -d ' ')"
+  if (( branches + tags > 0 )); then
+    if ! git -C "$dir/repo.git" bundle create --quiet "$dir/code.bundle" --all; then
+      rm -rf "$dir"
+      part_failed code "git could not bundle ${repository}. Nothing was uploaded for the code."
+      return
+    fi
+    if ! git -C "$dir/repo.git" bundle verify --quiet "$dir/code.bundle" >/dev/null; then
+      rm -rf "$dir"
+      part_failed code "The code bundle did not verify. Nothing was uploaded for the code."
+      return
+    fi
   else
     echo "${repository} has no commits yet, so this copy holds no code."
   fi
@@ -701,14 +1035,15 @@ copy_code() {
   if ! counts="$(node "$ROOT/scripts/github-metadata.mjs" "$dir/github" 2>"$WORKDIR/metadata.err")"; then
     local reason
     reason="$(tail -n 1 "$WORKDIR/metadata.err")"
-    rm -f "$WORKDIR/metadata.err"
-    fail "${reason:-The GitHub metadata copy failed.} Nothing was uploaded for the code."
+    rm -rf "$dir" "$WORKDIR/metadata.err"
+    part_failed code "${reason:-The GitHub metadata copy failed.} Nothing was uploaded for the code."
+    return
   fi
   cat "$WORKDIR/metadata.err"
   rm -f "$WORKDIR/metadata.err"
-  read -r GITHUB_ISSUES GITHUB_PULLS GITHUB_COMMENTS <<<"$counts"
+  local issues pulls comments
+  read -r issues pulls comments <<<"$counts"
   tar -C "$dir" -czf "$WORKDIR/code.tar.gz" .
-  CODE_BYTES="$(wc -c <"$WORKDIR/code.tar.gz" | tr -d ' ')"
   local suffix
   suffix="$(encrypted_suffix)"
   if [[ -n "$suffix" ]]; then
@@ -716,8 +1051,13 @@ copy_code() {
   fi
   s3_copy cp "$WORKDIR/code.tar.gz${suffix}" "s3://${BUCKET}/${PREFIX}/repo/${STAMP}.tar.gz${suffix}"
   record_copy "$WORKDIR/code.tar.gz${suffix}" "${PREFIX}/repo/${STAMP}.tar.gz${suffix}"
+  # The counts go in the check-in only once the copy is up: a night whose code copy failed reports none.
+  CODE_BRANCHES="$branches"
+  CODE_TAGS="$tags"
+  CODE_BYTES="$(wc -c <"$WORKDIR/code.tar.gz" | tr -d ' ')"
+  read -r GITHUB_ISSUES GITHUB_PULLS GITHUB_COMMENTS <<<"$counts"
   rm -rf "$dir" "$WORKDIR/code.tar.gz" "$WORKDIR/code.tar.gz${suffix}"
-  echo "Code: ${CODE_BRANCHES} branches, ${CODE_TAGS} tags. GitHub: ${GITHUB_ISSUES} issues, ${GITHUB_PULLS} pull requests, ${GITHUB_COMMENTS} comments."
+  echo "Code: ${CODE_BRANCHES} branches, ${CODE_TAGS} tags. GitHub: ${issues} issues, ${pulls} pull requests, ${comments} comments."
 }
 
 # The project ref from the Session pooler username, role.<project-ref>, unless supabase-project-ref names it.
@@ -733,12 +1073,34 @@ supabase_project_ref() {
   fi
 }
 
-# A Supabase setup or Vercel copy that cannot run does not stop the night: the users check still runs and reports,
-# then the run fails before retention, which deletes by age and would otherwise remove older copies of that part
-# while tonight's is missing.
+# A files, code, Supabase setup or Vercel copy that cannot run does not stop the night: the users check still runs and
+# reports, then the run fails before retention, which deletes by age and would otherwise remove older copies of that
+# part while tonight's is missing. Takes the part's name, then why it failed.
+FAILED_PARTS=()
 part_failed() {
-  PART_ERRORS="${PART_ERRORS:+$PART_ERRORS }$1"
-  echo "$1 The users check still runs; then this run fails." >&2
+  FAILED_PARTS+=("$1")
+  PART_ERRORS="${PART_ERRORS:+$PART_ERRORS }$2"
+  echo "$2 The users check still runs; then this run fails." >&2
+}
+
+# The night's error when parts failed. The check-in keeps its first 300 characters, so with two or more parts it names
+# them all first, then says why each failed: a long first reason no longer hides the others.
+part_errors() {
+  local count=${#FAILED_PARTS[@]} names="" i
+  if (( count < 2 )); then
+    printf '%s' "$PART_ERRORS"
+    return
+  fi
+  for ((i = 0; i < count; i++)); do
+    if (( i == 0 )); then
+      names="${FAILED_PARTS[i]}"
+    elif (( i == count - 1 )); then
+      names="$names and ${FAILED_PARTS[i]}"
+    else
+      names="$names, ${FAILED_PARTS[i]}"
+    fi
+  done
+  printf '%s' "${count} parts failed: ${names}. ${PART_ERRORS}"
 }
 
 copy_supabase_setup() {
@@ -754,7 +1116,7 @@ copy_supabase_setup() {
   local ref
   ref="$(supabase_project_ref)"
   if [[ ! "$ref" =~ ^[a-z]{20}$ ]]; then
-    part_failed "Set supabase-project-ref to the project's 20-letter ref, so the workflow knows whose Edge Functions and settings to copy."
+    part_failed "Supabase setup" "Set supabase-project-ref to the project's 20-letter ref, so the workflow knows whose Edge Functions and settings to copy."
     return
   fi
   local dir="$WORKDIR/setup"
@@ -765,7 +1127,7 @@ copy_supabase_setup() {
     local reason
     reason="$(tail -n 1 "$WORKDIR/setup.err")"
     rm -rf "$dir" "$WORKDIR/setup.err"
-    part_failed "${reason:-The Supabase setup copy failed.} Nothing was uploaded for the Supabase setup."
+    part_failed "Supabase setup" "${reason:-The Supabase setup copy failed.} Nothing was uploaded for the Supabase setup."
     return
   fi
   cat "$WORKDIR/setup.err"
@@ -806,7 +1168,7 @@ copy_vercel_env() {
     local reason
     reason="$(tail -n 1 "$WORKDIR/vercel.err")"
     rm -rf "$dir" "$WORKDIR/vercel.err"
-    part_failed "${reason:-The Vercel environment variable copy failed.} Nothing was uploaded for Vercel."
+    part_failed Vercel "${reason:-The Vercel environment variable copy failed.} Nothing was uploaded for Vercel."
     return
   fi
   rm -f "$WORKDIR/vercel.err"
@@ -840,7 +1202,7 @@ copy_vercel_env() {
       echo "::warning::This token cannot read the DNS records of ${VERCEL_DNS_UNREADABLE} of the project's domains, most likely because their DNS is kept outside Vercel. Keep a copy of those records yourself: LastGood cannot restore them."
     fi
   else
-    part_failed "${settings_failed:-The Vercel settings copy failed.} The environment variables still went up."
+    part_failed "Vercel settings" "${settings_failed:-The Vercel settings copy failed.} The environment variables still went up."
   fi
 }
 
@@ -899,6 +1261,7 @@ restore_code() {
   rm -rf "$dir"
   mkdir -p "$dir"
   s3_copy cp "s3://${BUCKET}/${key}" "$WORKDIR/code.download"
+  note_opened "$key" "$WORKDIR/code.download"
   open_code_copy "$key" "$WORKDIR/code.download" "$WORKDIR/code-restore.tar.gz"
   local listing names problem
   if ! listing="$(tar -tvzf "$WORKDIR/code-restore.tar.gz" 2>/dev/null)" || ! names="$(tar -tzf "$WORKDIR/code-restore.tar.gz" 2>/dev/null)"; then
@@ -969,6 +1332,7 @@ restore_setup() {
   rm -rf "$dir"
   mkdir -p "$dir"
   s3_copy cp "s3://${BUCKET}/${key}" "$WORKDIR/setup.download"
+  note_opened "$key" "$WORKDIR/setup.download"
   if [[ "$key" == *.age ]]; then
     decrypt_age_file "$WORKDIR/setup.download" "$WORKDIR/setup-restore.tar.gz"
   elif [[ "$key" == *.enc ]]; then
@@ -1027,6 +1391,7 @@ restore_storage() {
   local dir="$WORKDIR/storage-restore"
   rm -rf "$dir" "$archive"
   s3_copy cp "s3://${BUCKET}/${key}" "$WORKDIR/storage.download"
+  note_opened "$key" "$WORKDIR/storage.download"
   if [[ "$key" == *.age ]]; then
     decrypt_age_file "$WORKDIR/storage.download" "$archive"
   elif [[ "$key" == *.enc ]]; then
@@ -1114,7 +1479,12 @@ start_postgis_target() {
     -p "${port}:5432" \
     --tmpfs /docker-entrypoint-initdb.d \
     "$image" >/dev/null || return 1
-  local i
+  restore_db_answers "$url"
+}
+
+# Whether the throwaway database answers, waiting as long as the workflow waits for it to start.
+restore_db_answers() {
+  local url="$1" i
   local tries="${LIFEBOAT_RESTORE_WAIT_TRIES:-60}"
   local pause="${LIFEBOAT_RESTORE_WAIT_SECONDS:-5}"
   # Over TCP, not docker exec: the image's first, socket-only server is not the one that stays up.
@@ -1190,15 +1560,22 @@ if [[ "$MODE" == "backup" ]]; then
   copy_supabase_setup
   copy_vercel_env
   count_auth_users "$WORKDIR/dump.backup"
-  [[ -z "$PART_ERRORS" ]] || fail "$PART_ERRORS"
+  [[ -z "$PART_ERRORS" ]] || fail "$(part_errors)"
   make_monthly_copies
   apply_retention
 elif [[ "$MODE" == "restore-test" ]]; then
   [[ -n "${RESTORE_DATABASE_URL:-}" ]] || fail "Set RESTORE_DATABASE_URL to the throwaway Postgres in this runner."
   [[ -x "$PG_RESTORE" ]] || command -v "$PG_RESTORE" >/dev/null || fail "pg_restore is not installed."
   [[ -x "$PSQL" ]] || command -v "$PSQL" >/dev/null || fail "psql is not installed."
+  # The workflow lets this run go on when its Start the restore database step fails, so that is reported here, before
+  # any download, instead of the month's test restore never checking in.
+  restore_db_answers "$RESTORE_DATABASE_URL" ||
+    fail "The throwaway database for the test restore did not answer, so nothing was restored. The workflow's Start the restore database step says why."
   key="$(latest_dump_key)" || fail "No .backup object was found under ${PREFIX}/db/."
+  RESTORE_COPY="${key##*/}"
+  copy_age_note "$RESTORE_COPY"
   s3_copy cp "s3://${BUCKET}/${key}" "$WORKDIR/restore.download"
+  note_opened "$key" "$WORKDIR/restore.download"
   if [[ "$key" == *.age ]]; then
     decrypt_age_file "$WORKDIR/restore.download" "$WORKDIR/restore.backup"
     rm -f "$WORKDIR/restore.download"

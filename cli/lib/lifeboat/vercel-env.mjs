@@ -72,8 +72,19 @@ export async function call(url, { token, fetchImpl, sleep, what }) {
       continue;
     }
     if (response.ok) {
+      // The body can still be cut off, or stall past the timeout, after the status arrives: try again as above.
+      // A body that arrives whole but isn't JSON would come back the same, so that one stops here.
+      let text;
       try {
-        return await response.json();
+        text = await response.text();
+      } catch {
+        last = `Vercel's answer was cut off when reading ${what}.`;
+        status = null;
+        if (attempt < ATTEMPTS) await sleep(1000 * 2 ** (attempt - 1));
+        continue;
+      }
+      try {
+        return JSON.parse(text);
       } catch {
         throw new VercelEnvError(`Vercel sent something other than JSON for ${what}.`);
       }
@@ -92,24 +103,10 @@ function targets(value) {
 }
 
 /**
- * Writes the project's environment variables to `file`, values included where Vercel returns them.
- * Returns the counts for the run's report.
+ * Each listed variable, with its value where Vercel returns one. Returns { gone: key } instead when Vercel answers
+ * 404 for one variable's value, so the caller can read the list again.
  */
-export async function exportVercelEnv({ api, project, team, token, file, fetchImpl = fetch, sleep = defaultSleep }) {
-  if (!token) throw new VercelEnvError("Set LIFEBOAT_VERCEL_TOKEN to copy the Vercel environment variables.");
-  if (!PROJECT.test(project ?? "")) throw new VercelEnvError("Set vercel-project-id to the Vercel project's ID (prj_...).");
-  if (team && !TEAM.test(team)) throw new VercelEnvError("vercel-team-id must be the team's ID (team_...).");
-  const base = `${(api || "https://api.vercel.com").replace(/\/+$/, "")}`;
-  const query = team ? `?teamId=${team}` : "";
-  const deps = { token, fetchImpl, sleep };
-
-  const listWhat = "the project's environment variables";
-  const listed = await call(`${base}/v10/projects/${encodeURIComponent(project)}/env${query}`, { ...deps, what: listWhat });
-  const envs = Array.isArray(listed) ? listed : listed?.envs;
-  if (!Array.isArray(envs)) throw new VercelEnvError(`Vercel sent something other than a list for ${listWhat}.`);
-  // A list that says there is more would leave variables out of the copy without anyone knowing.
-  if (listed?.pagination?.next) throw new VercelEnvError(`Vercel sent ${listWhat} in more than one page, which this copy cannot read yet.`);
-
+async function readVariables(envs, { base, project, query, deps }) {
   const variables = [];
   for (const env of envs) {
     const key = typeof env?.key === "string" ? env.key : "";
@@ -135,7 +132,13 @@ export async function exportVercelEnv({ api, project, team, token, file, fetchIm
     } else {
       if (typeof env.id !== "string" || !ENV_ID.test(env.id)) throw new VercelEnvError(`Vercel listed ${key} without an ID this copy can read.`);
       const what = `the value of ${key}`;
-      const one = await call(`${base}/v1/projects/${encodeURIComponent(project)}/env/${env.id}${query}`, { ...deps, what });
+      let one;
+      try {
+        one = await call(`${base}/v1/projects/${encodeURIComponent(project)}/env/${env.id}${query}`, { ...deps, what });
+      } catch (error) {
+        if (error instanceof VercelEnvError && error.status === 404) return { gone: key };
+        throw error;
+      }
       if (typeof one?.value === "string" && (one.decrypted === true || one.type === "plain")) {
         entry.value = one.value;
       } else {
@@ -143,6 +146,38 @@ export async function exportVercelEnv({ api, project, team, token, file, fetchIm
       }
     }
     variables.push(entry);
+  }
+  return { variables };
+}
+
+/**
+ * Writes the project's environment variables to `file`, values included where Vercel returns them.
+ * Returns the counts for the run's report.
+ */
+export async function exportVercelEnv({ api, project, team, token, file, fetchImpl = fetch, sleep = defaultSleep }) {
+  if (!token) throw new VercelEnvError("Set LIFEBOAT_VERCEL_TOKEN to copy the Vercel environment variables.");
+  if (!PROJECT.test(project ?? "")) throw new VercelEnvError("Set vercel-project-id to the Vercel project's ID (prj_...).");
+  if (team && !TEAM.test(team)) throw new VercelEnvError("vercel-team-id must be the team's ID (team_...).");
+  const base = `${(api || "https://api.vercel.com").replace(/\/+$/, "")}`;
+  const query = team ? `?teamId=${team}` : "";
+  const deps = { token, fetchImpl, sleep };
+
+  const listWhat = "the project's environment variables";
+  // A variable removed or replaced between the list and its own read answers 404, which on its own reads as the whole
+  // project missing. The copy then starts again from a fresh list, once, so it matches the project as it now is. A 404
+  // on the list itself still means the project is not there.
+  let variables = null;
+  for (let pass = 1; !variables; pass += 1) {
+    const listed = await call(`${base}/v10/projects/${encodeURIComponent(project)}/env${query}`, { ...deps, what: listWhat });
+    const envs = Array.isArray(listed) ? listed : listed?.envs;
+    if (!Array.isArray(envs)) throw new VercelEnvError(`Vercel sent something other than a list for ${listWhat}.`);
+    // A list that says there is more would leave variables out of the copy without anyone knowing.
+    if (listed?.pagination?.next) throw new VercelEnvError(`Vercel sent ${listWhat} in more than one page, which this copy cannot read yet.`);
+    const read = await readVariables(envs, { base, project, query, deps });
+    if (read.gone && pass === 2) {
+      throw new VercelEnvError(`Vercel answered that ${read.gone} is not there, though it was on the project's list a moment before. The next run tries again.`, 404);
+    }
+    variables = read.variables;
   }
 
   writeFileSync(file, JSON.stringify({ project, teamId: team || null, variables }), { mode: 0o600 });

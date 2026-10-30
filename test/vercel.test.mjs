@@ -195,6 +195,58 @@ test("a bad project or team ID, or a list Vercel sent in pages, stops before any
   assert.equal(existsSync(file), false);
 });
 
+test("a variable removed or replaced while the copy runs starts the copy again from a fresh list, not a missing project", async () => {
+  // The first list still has env_enc1; by the time its value is read it is gone, then the list is read again.
+  const changing = (secondList) => {
+    let lists = 0;
+    const seen = [];
+    const routes = answers({ [`GET /v1/projects/${PROJECT}/env/env_enc1`]: undefined });
+    const fetchImpl = async (url) => {
+      const { pathname } = new URL(url);
+      seen.push(pathname);
+      if (pathname === `/v10/projects/${PROJECT}/env`) {
+        lists += 1;
+        if (lists > 1) return secondList ? fakeFetch({ [`GET ${pathname}`]: secondList })(url) : new Response("{}", { status: 404 });
+      }
+      return fakeFetch(routes)(url);
+    };
+    return { fetchImpl, seen };
+  };
+  const copy = (fetchImpl, file = tempFile()) => exportVercelEnv({ api: API, project: PROJECT, token: TOKEN, file, fetchImpl, sleep: noSleep });
+
+  // Removed: the copy matches the project as it now is.
+  const removed = changing({ json: { envs: ENVS.filter((env) => env.id !== "env_enc1") } });
+  const file = tempFile();
+  assert.deepEqual(await copy(removed.fetchImpl, file), { variables: 4, withValue: 1, withoutValue: 3 });
+  assert.deepEqual(
+    JSON.parse(readFileSync(file, "utf8")).variables.map((entry) => entry.key),
+    ["NEXT_PUBLIC_SITE_URL", "SUPABASE_SERVICE_ROLE_KEY", "VERCEL_URL", "PREVIEW_ONLY_FLAG"],
+  );
+  assert.equal(removed.seen.filter((pathname) => pathname.endsWith("/env")).length, 2, "the list is read once more, no more");
+
+  // Replaced, as a value change by delete and add does: the new variable's value is copied.
+  const rotated = { id: "env_enc2", key: "STRIPE_WEBHOOK_SECRET", type: "encrypted", value: "eyJ2IjoibmV3In0", target: ["production"] };
+  const replaced = changing({ json: { envs: ENVS.map((env) => (env.id === "env_enc1" ? rotated : env)) } });
+  const replacedFile = tempFile();
+  const routesWithNew = answers({ [`GET /v1/projects/${PROJECT}/env/env_enc2`]: { json: { key: "STRIPE_WEBHOOK_SECRET", type: "encrypted", decrypted: true, value: ENCRYPTED_VALUE } } });
+  const replacedFetch = async (url) => (new URL(url).pathname.endsWith("/env_enc2") ? fakeFetch(routesWithNew)(url) : replaced.fetchImpl(url));
+  assert.deepEqual(await copy(replacedFetch, replacedFile), { variables: 5, withValue: 2, withoutValue: 3 });
+  const byKey = Object.fromEntries(JSON.parse(readFileSync(replacedFile, "utf8")).variables.map((entry) => [entry.key, entry]));
+  assert.equal(byKey.STRIPE_WEBHOOK_SECRET.value, ENCRYPTED_VALUE);
+
+  // The project itself gone: the list's own 404 still says so.
+  await assert.rejects(copy(changing(null).fetchImpl), /Vercel found no such project for this token when reading the project's environment variables\./);
+
+  // Still listed, still 404: stops after one fresh list, by name, without blaming the project.
+  const stuck = changing({ json: { envs: ENVS } });
+  await assert.rejects(copy(stuck.fetchImpl), (error) => {
+    assert.equal(error.message, "Vercel answered that STRIPE_WEBHOOK_SECRET is not there, though it was on the project's list a moment before. The next run tries again.");
+    assert.ok(!error.message.includes(TOKEN));
+    return true;
+  });
+  assert.equal(stuck.seen.filter((pathname) => pathname.endsWith("/env")).length, 2);
+});
+
 test("the settings copy keeps what a rebuild needs, and leaves out deploy hook URLs, bypass secrets and environment variables", async () => {
   const file = tempFile("settings.json");
   const calls = [];
@@ -282,6 +334,36 @@ test("the settings copy reads every page of domains and DNS records, and stops o
     /Vercel's pages of the project's domains did not move on/,
   );
   assert.equal(existsSync(stuckFile), false);
+});
+
+test("the settings copy reads 20 pages of a list but not 21, takes 50 apex domains but not 51, and keeps a list of 100 but not 101", async () => {
+  const NEXT = 1700000000000;
+  const json = (body) => new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+  const vercel = (pages, apexes) => async (url) => {
+    const { pathname, searchParams } = new URL(url);
+    if (pathname === `/v9/projects/${PROJECT}`) return json({ name: "notes" });
+    if (pathname === `/v9/projects/${PROJECT}/domains`) {
+      const page = searchParams.has("until") ? Number(searchParams.get("until")) - NEXT : 0;
+      const domains = page === 0 ? Array.from({ length: apexes }, (_, index) => ({ name: `app${index}.example`, apexName: `app${index}.example` })) : [];
+      return json({ domains, pagination: { next: page + 1 < pages ? NEXT + page + 1 : null } });
+    }
+    return json({ records: [], pagination: { next: null } });
+  };
+  const copy = (pages, apexes) => exportVercelSettings({ api: API, project: PROJECT, token: TOKEN, file: tempFile("settings.json"), fetchImpl: vercel(pages, apexes), sleep: noSleep });
+  assert.deepEqual(await copy(20, 1), { domains: 1, records: 0, unreadable: 0 });
+  await assert.rejects(copy(21, 1), /Vercel sent the project's domains in more than 20 pages, which this copy cannot read yet\./);
+  assert.deepEqual(await copy(1, 50), { domains: 50, records: 0, unreadable: 0 });
+  await assert.rejects(copy(1, 51), /The project has domains under more than 50 apex domains, which this copy cannot read yet\./);
+
+  const regions = (count) => Array.from({ length: count }, (_, index) => `r${index}`);
+  assert.deepEqual(projectSettings({ resourceConfig: { functionDefaultRegions: regions(100) } }).resourceConfig, { functionDefaultRegions: regions(100) });
+  assert.deepEqual(projectSettings({ resourceConfig: { functionDefaultRegions: regions(101) } }).resourceConfig, {});
+});
+
+test("Vercel Authentication switched off is kept as null, so a rebuild can tell the old project was open", () => {
+  assert.equal(projectSettings({ name: "notes", ssoProtection: null }).ssoProtection, null);
+  assert.ok(!("ssoProtection" in projectSettings({ name: "notes" })), "a project that does not say is left without it");
+  assert.deepEqual(projectSettings({ ssoProtection: { deploymentType: "preview", other: 1 } }).ssoProtection, { deploymentType: "preview" });
 });
 
 test("the settings copy fails on a token Vercel refuses or a DNS read that errors, and checks its inputs before calling Vercel", async () => {
@@ -534,4 +616,116 @@ test("a Vercel call that never answers is given up after a minute and tried agai
   assert.equal(stuck.calls(), 3);
   assert.deepEqual(stuck.limits(), [CALL_TIMEOUT_MS, CALL_TIMEOUT_MS, CALL_TIMEOUT_MS]);
   assert.equal(CALL_TIMEOUT_MS, 60_000);
+});
+
+test("a variable Vercel lists bare, in a bare list, is kept with no targets, an unknown type and no branch or comment, and a project without a team asks for no team", async () => {
+  const file = tempFile();
+  const seen = [];
+  const routes = answers({
+    [`GET /v10/projects/${PROJECT}/env`]: { json: [{ id: "env_bare1", key: "BARE_FLAG" }] },
+    [`GET /v1/projects/${PROJECT}/env/env_bare1`]: { json: { key: "BARE_FLAG", type: "plain", value: "on" } },
+  });
+  const counts = await exportVercelEnv({ api: API, project: PROJECT, token: TOKEN, file, fetchImpl: fakeFetch(routes, seen), sleep: noSleep });
+  assert.deepEqual(counts, { variables: 1, withValue: 1, withoutValue: 0 });
+  const copy = JSON.parse(readFileSync(file, "utf8"));
+  assert.equal(copy.teamId, null);
+  assert.deepEqual(copy.variables, [
+    { key: "BARE_FLAG", type: "unknown", target: [], gitBranch: null, customEnvironmentIds: [], comment: null, value: "on", note: null },
+  ]);
+  assert.deepEqual(seen.map((call) => call.search), ["", ""]);
+});
+
+test("a variable whose name is not text stops the copy, and a project left unset is never asked for", async () => {
+  const file = tempFile();
+  await assert.rejects(
+    exportVercelEnv({
+      api: API,
+      project: PROJECT,
+      token: TOKEN,
+      file,
+      fetchImpl: fakeFetch(answers({ [`GET /v10/projects/${PROJECT}/env`]: { json: { envs: [{ id: "env_num1", key: 42, type: "plain", value: "x" }] } } })),
+      sleep: noSleep,
+    }),
+    (error) => error.message === "Vercel listed an environment variable without a usable name.",
+  );
+  assert.equal(existsSync(file), false);
+
+  // VERCEL_PROJECT_ID unset reaches the copies as no project at all.
+  const neverCalled = async () => assert.fail("Vercel should not be called");
+  await assert.rejects(exportVercelEnv({ token: TOKEN, file, fetchImpl: neverCalled }), /Set vercel-project-id/);
+  await assert.rejects(exportVercelSettings({ token: TOKEN, file, fetchImpl: neverCalled }), /Set vercel-project-id/);
+});
+
+test("the settings copy asks for no team when the project has none", async () => {
+  const calls = [];
+  await exportVercelSettings({ api: API, project: PROJECT, token: TOKEN, file: tempFile("settings.json"), fetchImpl: recording(answers(), calls), sleep: noSleep });
+  assert.equal(calls.length, 4);
+  for (const call of calls) assert.equal(new URL(call.url).searchParams.has("teamId"), false, call.url);
+});
+
+test("the settings copy drops a number JSON cannot hold, text over 4096 characters, and a list holding anything but plain values", () => {
+  const raw = JSON.parse(`{"skewProtectionMaxAge": 1e999, "nodeVersion": "22.x", "buildCommand": "${"x".repeat(4097)}", "installCommand": "${"y".repeat(4096)}"}`);
+  assert.deepEqual(projectSettings(raw), { nodeVersion: "22.x", installCommand: "y".repeat(4096) });
+  assert.deepEqual(projectSettings({ resourceConfig: { functionDefaultRegions: ["syd1", { region: "iad1" }] } }).resourceConfig, {});
+  assert.deepEqual(projectSettings({ resourceConfig: { functionDefaultRegions: ["syd1", ["iad1"]] } }).resourceConfig, {});
+  assert.deepEqual(projectSettings({ resourceConfig: { functionDefaultRegions: ["syd1", null, 2, true] } }).resourceConfig, { functionDefaultRegions: ["syd1", null, 2, true] });
+});
+
+test("without a sleep given, a busy answer waits a second on the clock before Vercel is asked again", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const settle = async () => {
+    for (let round = 0; round < 10; round += 1) await new Promise((resolve) => setImmediate(resolve));
+  };
+  const busyFirst = (route, answer) => {
+    let tries = 0;
+    const fetchImpl = async (url) => {
+      if (new URL(url).pathname === route && ++tries === 1) return new Response('{"error":{"code":"busy"}}', { status: 503 });
+      return fakeFetch(answers({ [`GET ${route}`]: { json: answer } }))(url);
+    };
+    return { fetchImpl, tries: () => tries };
+  };
+  for (const [name, route, answer, copy] of [
+    ["env", `/v10/projects/${PROJECT}/env`, { envs: [] }, (fetchImpl) => exportVercelEnv({ api: API, project: PROJECT, token: TOKEN, file: tempFile(), fetchImpl })],
+    ["settings", `/v9/projects/${PROJECT}`, { name: "notes" }, (fetchImpl) => exportVercelSettings({ api: API, project: PROJECT, token: TOKEN, file: tempFile("settings.json"), fetchImpl })],
+  ]) {
+    const busy = busyFirst(route, answer);
+    const done = copy(busy.fetchImpl);
+    await settle();
+    assert.equal(busy.tries(), 1, name);
+    t.mock.timers.tick(999);
+    await settle();
+    assert.equal(busy.tries(), 1, `${name} is not asked again before the second is up`);
+    t.mock.timers.tick(1);
+    await done;
+    assert.equal(busy.tries(), 2, name);
+  }
+});
+
+test("vercel-env.mjs and vercel-settings.mjs print a plain line, never Node's own error, when the copy fails in an unexpected way", async () => {
+  const api = await fakeVercel(answers());
+  const notAFolder = path.join(mkdtempSync(path.join(tmpdir(), "lg-vercel-")), "not-a-folder");
+  writeFileSync(notAFolder, "");
+  const run = (script, file) =>
+    new Promise((resolve) => {
+      const child = spawn(process.execPath, [path.join(ROOT, "scripts", script), file], {
+        env: { PATH: process.env.PATH, VERCEL_API_URL: `http://127.0.0.1:${api.port}`, VERCEL_PROJECT_ID: PROJECT, LIFEBOAT_VERCEL_TOKEN: TOKEN },
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk) => (stdout += chunk));
+      child.stderr.on("data", (chunk) => (stderr += chunk));
+      child.on("close", (code) => resolve({ code, stdout, stderr }));
+    });
+  try {
+    const env = await run("vercel-env.mjs", path.join(notAFolder, "env.json"));
+    assert.equal(env.code, 1);
+    assert.equal(env.stderr, "The Vercel environment variable copy failed.\n");
+    assert.equal(env.stdout, "");
+    const settings = await run("vercel-settings.mjs", path.join(notAFolder, "settings.json"));
+    assert.equal(settings.code, 1);
+    assert.equal(settings.stderr, "The Vercel settings copy failed.\n");
+    assert.equal(settings.stdout, "");
+  } finally {
+    api.server.close();
+  }
 });

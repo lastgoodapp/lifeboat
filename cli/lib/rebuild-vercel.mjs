@@ -2,7 +2,7 @@ import { mkdir, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import { PROJECT, TEAM } from "./lifeboat/vercel-env.mjs";
 import { clean } from "./rebuild-list.mjs";
-import { checkArchive, counted, run, StepError } from "./rebuild.mjs";
+import { checkArchive, counted, noAnswer, run, StepError, timeLimit } from "./rebuild.mjs";
 import { otherRefs } from "./rebuild-setup.mjs";
 
 /**
@@ -137,10 +137,13 @@ export function defaultSleep(ms) {
 }
 
 /**
- * Vercel API calls for one project: retried on a network error, 429 or 5xx, unless `init.retry` is false, for a write
- * that a retry could make twice; a refused token stops the step.
+ * Vercel API calls for one project, each with a time limit; a refused token stops the step. A read is tried again on
+ * a network error, no answer in time, a cut-off answer, a 429 or a 5xx. A write is sent again as it is only after a
+ * 429, which Vercel sends before taking anything. When its answer is lost, cut off or a 5xx, the write may have gone
+ * in, so `init.landed` reads back whether it did, and it is sent again only if not. A write with no way to read it
+ * back is sent once.
  */
-export function vercelClient({ api, project, team, token, fetchImpl, sleep }) {
+export function vercelClient({ api, project, team, token, fetchImpl, sleep, limit = timeLimit }) {
   const base = `${(api || DEFAULT_API).replace(/\/+$/, "")}`;
   // A value sent is hidden from the message too, unless it is too short to be a secret. The token always is.
   const hide = (text, values = []) =>
@@ -149,45 +152,63 @@ export function vercelClient({ api, project, team, token, fetchImpl, sleep }) {
     `${base}${pathname.replace("{project}", encodeURIComponent(project))}${team ? `${pathname.includes("?") ? "&" : "?"}teamId=${team}` : ""}`;
 
   async function call(pathname, init, what, values = []) {
-    const { retry = true, ...request } = init ?? {};
-    const attempts = retry ? ATTEMPTS : 1;
+    const { landed, ...request } = init ?? {};
+    const write = Boolean(request.method);
     let last = null;
-    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
       let response;
+      const ms = limit();
       try {
         response = await fetchImpl(url(pathname), {
           ...request,
           headers: { Accept: "application/json", Authorization: `Bearer ${token}`, "User-Agent": "lastgood-cli", ...(request.headers ?? {}) },
+          signal: AbortSignal.timeout(ms),
         });
-      } catch {
-        last = { status: 0, message: "Vercel could not be reached" };
-        if (attempt < attempts) await sleep(1000 * 2 ** (attempt - 1));
-        continue;
+      } catch (error) {
+        last = { status: 0, message: noAnswer(error, ms, "Vercel"), unsure: true };
       }
-      if (response.ok) {
+      if (response?.ok) {
+        let text = null;
         try {
-          return { body: await response.json() };
+          text = await response.text();
         } catch {
-          throw new StepError(`Vercel sent something other than JSON when ${what}.`);
+          last = { status: 0, message: "Vercel's answer was cut off", unsure: true };
         }
+        if (text !== null) {
+          try {
+            return { body: JSON.parse(text) };
+          } catch {
+            throw new StepError(`Vercel sent something other than JSON when ${what}.`);
+          }
+        }
+      } else if (response) {
+        const refusal = await refusalOf(response, pathname, request, what, values);
+        if (response.status < 500 && response.status !== 429) return { refusal };
+        last = { ...refusal, unsure: response.status !== 429 };
       }
-      let message = "";
-      try {
-        const body = await response.json();
-        message = typeof body?.error?.message === "string" ? body.error.message : typeof body?.message === "string" ? body.message : "";
-      } catch {
-        message = "";
-      }
-      if (response.status === 401) throw new StepError(`Vercel refused the token in LASTGOOD_VERCEL_TOKEN when ${what}. It may have expired: make a new one.`);
-      // A 403 on a domain's own path means the domain is not this team's, which the caller handles.
-      if (response.status === 403 && pathname.includes("{project}")) throw new StepError(`The token in LASTGOOD_VERCEL_TOKEN cannot reach the new project when ${what}. Make it in the team that owns the project, and give --vercel-team for a team project.`);
-      if (response.status === 404 && !request.method && pathname.includes("{project}")) throw new StepError(`Vercel found no project ${project} for this token when ${what}. Check --vercel-project, and --vercel-team for a team project.`);
-      const refusal = { status: response.status, message: hide(message || `HTTP ${response.status}`, values) };
-      if (response.status < 500 && response.status !== 429) return { refusal };
-      last = refusal;
-      if (attempt < attempts) await sleep(waitFor(response, attempt));
+      if (attempt === ATTEMPTS || (write && last.unsure && !landed)) break;
+      await sleep(response && !response.ok ? waitFor(response, attempt) : 1000 * 2 ** (attempt - 1));
+      if (write && last.unsure && (await landed())) return { body: null, landed: true };
     }
-    return { refusal: last };
+    // A write whose last try may have gone in is looked for once more before it counts as refused.
+    if (write && last.unsure && landed && (await landed())) return { body: null, landed: true };
+    return { refusal: { status: last.status, message: last.message } };
+  }
+
+  /** A refusal's status and reason, with the token and the values sent hidden. Stops the step on a refused token or project. */
+  async function refusalOf(response, pathname, request, what, values) {
+    let message = "";
+    try {
+      const body = await response.json();
+      message = typeof body?.error?.message === "string" ? body.error.message : typeof body?.message === "string" ? body.message : "";
+    } catch {
+      message = "";
+    }
+    if (response.status === 401) throw new StepError(`Vercel refused the token in LASTGOOD_VERCEL_TOKEN when ${what}. It may have expired: make a new one.`);
+    // A 403 on a domain's own path means the domain is not this team's, which the caller handles.
+    if (response.status === 403 && pathname.includes("{project}")) throw new StepError(`The token in LASTGOOD_VERCEL_TOKEN cannot reach the new project when ${what}. Make it in the team that owns the project, and give --vercel-team for a team project.`);
+    if (response.status === 404 && !request.method && pathname.includes("{project}")) throw new StepError(`Vercel found no project ${project} for this token when ${what}. Check --vercel-project, and --vercel-team for a team project.`);
+    return { status: response.status, message: hide(message || `HTTP ${response.status}`, values) };
   }
 
   async function json(pathname, what) {
@@ -236,10 +257,10 @@ async function readCopy(archive, work) {
  * Puts the copy's environment variables into the new Vercel project, keeping every one already there, then lists what
  * the customer adds or changes by hand. `ref` is the new Supabase project, when it is known.
  */
-export async function rebuildVercel({ archive, project, team, token, ref = null, work, say, todo = say, api, fetchImpl = fetch, sleep = defaultSleep }) {
+export async function rebuildVercel({ archive, project, team, token, ref = null, work, say, todo = say, api, fetchImpl = fetch, sleep = defaultSleep, limit = timeLimit }) {
   const secret = checkVercelToken(token);
   const target = vercelTarget(project, team);
-  const client = vercelClient({ api, ...target, token: secret, fetchImpl, sleep });
+  const client = vercelClient({ api, ...target, token: secret, fetchImpl, sleep, limit });
   const variables = await readCopy(archive, work);
 
   // The token and the project, before anything is written.
@@ -251,6 +272,8 @@ export async function rebuildVercel({ archive, project, team, token, ref = null,
 
   const before = await listEnv(client, "listing the new project's environment variables");
   const planned = plan(variables, before);
+  const listed = (envs, entry) =>
+    envs.some((have) => have?.key === entry.key && branchOf(have) === branchOf(entry) && entry.target.every((name) => targetsOf(have).includes(name)));
   const put = [];
   const refused = [];
   for (const entry of planned.put) {
@@ -259,7 +282,13 @@ export async function rebuildVercel({ archive, project, team, token, ref = null,
     if (typeof entry.comment === "string" && entry.comment) body.comment = entry.comment;
     const { body: answer, refusal } = await client.call(
       "/v10/projects/{project}/env",
-      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        // Only a variable the project lacked is sent, so finding it listed means this one went in.
+        landed: async () => listed(await listEnv(client, `checking whether ${entry.key} went in`), entry),
+      },
       `putting back ${entry.key}`,
       [entry.value],
     );
@@ -270,10 +299,7 @@ export async function rebuildVercel({ archive, project, team, token, ref = null,
     else put.push(entry);
   }
 
-  // A POST that reached Vercel before the network dropped is sent again, and the retry is refused because the
-  // variable is now there. One the project lists that was not there before is kept, not a failure.
-  const listed = (envs, entry) =>
-    envs.some((have) => have?.key === entry.key && branchOf(have) === branchOf(entry) && entry.target.every((name) => targetsOf(have).includes(name)));
+  // A refusal for a variable the project now lists, made by hand or by another run meanwhile, is kept, not a failure.
   if (refused.length > 0) {
     const now = await listEnv(client, "checking the variables Vercel refused");
     for (const item of refused.filter(({ entry }) => listed(now, entry))) {

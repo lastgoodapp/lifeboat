@@ -2,7 +2,7 @@ import { isDeepStrictEqual } from "node:util";
 import { mkdir, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import { checkVercelToken, defaultSleep, vercelClient, vercelTarget } from "./rebuild-vercel.mjs";
-import { checkArchive, counted, run, StepError } from "./rebuild.mjs";
+import { checkArchive, counted, holds, run, StepError, timeLimit } from "./rebuild.mjs";
 
 /**
  * The Vercel project's settings, domains and DNS records back into a new project (R4), from the settings the
@@ -12,8 +12,8 @@ import { checkArchive, counted, run, StepError } from "./rebuild.mjs";
  * Only the settings that differ from the new project's are sent. A domain already on the new project is kept. DNS
  * records go only into a zone this token can read, and only for a name and type whose records there are all in the
  * copy too, so a record changed since the backup is never doubled up with the copy's older one, and a rerun carries
- * on. What Vercel refuses, a domain still to prove, a zone kept elsewhere and the deploy hooks (which get new URLs) are
- * listed for the customer instead. Nothing is ever deleted.
+ * on. What Vercel refuses, a domain still to prove, a zone kept elsewhere, a DNS record the backup kept without its
+ * value and the deploy hooks (which get new URLs) are listed for the customer instead. Nothing is ever deleted.
  */
 
 /** The project settings a rebuild sets, as the backup keeps them (lifeboat/scripts/vercel-settings.mjs). */
@@ -88,7 +88,10 @@ function parts(change) {
 
 async function patchSettings(client, change) {
   if (Object.keys(change).length === 0) return { applied: [], refused: [] };
-  const patch = (sent) => client.call("/v9/projects/{project}", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(sent) }, "changing the new project's settings");
+  // A change read back as set went in, whatever happened to its answer.
+  const landed = (sent) => async () => holds(await client.json("/v9/projects/{project}", "checking the new project's settings"), sent);
+  const patch = (sent) =>
+    client.call("/v9/projects/{project}", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(sent), landed: landed(sent) }, "changing the new project's settings");
   const split = parts(change);
   const whole = await patch(body(change));
   if (!whole.refusal) return { applied: split.map((part) => part.label), refused: [] };
@@ -187,23 +190,38 @@ function sameRecord(a, b) {
   return recordType(a) !== "MX" || Number(a?.mxPriority ?? a?.priority ?? 0) === Number(b?.mxPriority ?? b?.priority ?? 0);
 }
 
-function label(apex, record) {
+/** The backup keeps no value longer than 4096 characters, so a record can come without one. */
+function hasValue(record) {
+  return record?.value !== undefined && record?.value !== null;
+}
+
+/** A record by its name and type, with an MX record's priority. */
+function recordWhere(apex, record) {
   const where = recordName(record) ? `${recordName(record)}.${apex}` : apex;
   const priority = recordType(record) === "MX" && record.mxPriority !== undefined && record.mxPriority !== null ? ` ${record.mxPriority}` : "";
-  return `${where} ${recordType(record)}${priority} ${String(record?.value ?? "").trim()}`;
+  return `${where} ${recordType(record)}${priority}`;
+}
+
+function label(apex, record) {
+  return `${recordWhere(apex, record)} ${hasValue(record) ? String(record.value).trim() : "(value too long to keep)"}`;
 }
 
 /**
  * What to do with one zone's records from the copy, against the zone now. Records are grouped by name and type: a
  * group whose records in the zone are all in the copy gets the copy's missing ones; a group with a record the copy
- * does not have was changed since the backup, so it is left as it is and named.
+ * does not have was changed since the backup, so it is left as it is and named. A record the backup kept without its
+ * value is never sent: it is named by its name and type, to add by hand.
  */
 export function planRecords(apex, copied, now) {
-  const result = { add: [], kept: 0, changed: [], byHand: [] };
+  const result = { add: [], kept: 0, changed: [], byHand: [], tooLong: [] };
   const groups = new Map();
   for (const record of copied) {
     if (!RECORD_TYPES.has(recordType(record))) {
       result.byHand.push(label(apex, record));
+      continue;
+    }
+    if (!hasValue(record)) {
+      result.tooLong.push(recordWhere(apex, record));
       continue;
     }
     const key = `${recordName(record)} ${recordType(record)}`;
@@ -236,10 +254,10 @@ function recordBody(record) {
  * Sets the copy's project settings on the new Vercel project, adds its domains and their DNS records where this token
  * reaches them, then lists what the customer does by hand.
  */
-export async function rebuildVercelSettings({ archive, project, team, token, work, say, todo = say, api, fetchImpl = fetch, sleep = defaultSleep }) {
+export async function rebuildVercelSettings({ archive, project, team, token, work, say, todo = say, api, fetchImpl = fetch, sleep = defaultSleep, limit = timeLimit }) {
   const secret = checkVercelToken(token);
   const target = vercelTarget(project, team);
-  const client = vercelClient({ api, ...target, token: secret, fetchImpl, sleep });
+  const client = vercelClient({ api, ...target, token: secret, fetchImpl, sleep, limit });
   const copy = await readSettings(archive, work);
   if (!copy) {
     todo("This Vercel copy has no project settings or domains: it was made before the backup copied them, or that night's settings copy failed. Set them by hand as the old project had them, in the project's settings in Vercel.");
@@ -255,9 +273,15 @@ export async function rebuildVercelSettings({ archive, project, team, token, wor
   const info = await client.json("/v9/projects/{project}", "reading the new project");
   const change = settingsChange(copy.settings, info);
   const settings = await patchSettings(client, change);
+  // The old project had Vercel Authentication off. A rebuild never opens a project to anyone on its own (Nick's B), so
+  // the new project keeps it on, and the difference is listed instead of the settings being called a match.
+  const open = copy.settings.ssoProtection === null && isObject(info?.ssoProtection);
   if (settings.applied.length > 0) say(`Project settings set as the old project had them: ${settings.applied.join(", ")}.`);
-  else if (settings.refused.length === 0) say("The new project's settings already match the copy's.");
+  else if (settings.refused.length === 0 && !open) say("The new project's settings already match the copy's.");
   if (settings.refused.length > 0) later(`Vercel did not take these settings, most likely because of the new project's plan. Set them by hand in the project's settings: ${settings.refused.join("; ")}.`);
+  if (open) {
+    later("The old project had Vercel Authentication off, so anyone with a link could open its deployments. The new project keeps it on. If the old project was open on purpose, turn it off by hand in the project's settings in Vercel, under Deployment Protection.");
+  }
   const branch = copy.settings.link?.productionBranch;
   if (typeof branch === "string" && branch && branch !== info?.link?.productionBranch) {
     later(`Build production from the ${branch} branch, as the old project did: set it as the production branch in the project's settings in Vercel.`);
@@ -293,7 +317,9 @@ export async function rebuildVercelSettings({ archive, project, team, token, wor
       sent.redirect = domain.redirect;
       if (Number.isInteger(domain.redirectStatusCode)) sent.redirectStatusCode = domain.redirectStatusCode;
     }
-    const { refusal } = await client.call("/v10/projects/{project}/domains", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(sent) }, `adding ${domain.name}`);
+    // Only a domain the project lacked is added, so finding it listed means this one went in.
+    const landed = async () => (await listDomains(client)).some((have) => String(have.name).toLowerCase() === domain.name.toLowerCase());
+    const { refusal } = await client.call("/v10/projects/{project}/domains", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(sent), landed }, `adding ${domain.name}`);
     if (refusal) refused.push({ name: domain.name, reason: refusal.message });
     else {
       added.push(domain.name);
@@ -302,7 +328,7 @@ export async function rebuildVercelSettings({ archive, project, team, token, wor
   }
   const after = wanted.length > 0 ? await listDomains(client) : before;
   const listedNow = new Map(after.map((domain) => [String(domain.name).toLowerCase(), domain]));
-  // A POST that reached Vercel before the network dropped is refused on its retry: one now listed counts as added.
+  // A refusal for a domain the project now lists, added by hand or by another run meanwhile, counts as added.
   for (const item of refused.filter(({ name }) => listedNow.has(name.toLowerCase()))) {
     added.push(item.name);
     refused.splice(refused.indexOf(item), 1);
@@ -346,20 +372,25 @@ export async function rebuildVercelSettings({ archive, project, team, token, wor
     keptRecords += planned.kept;
     const put = [];
     const failed = [];
+    const there = (listed, record) => (listed ?? []).some((have) => recordType(have) === recordType(record) && recordName(have) === recordName(record) && sameRecord(have, record));
     for (const record of planned.add) {
-      // Not retried: a create that reached Vercel before the network dropped would make the record twice.
-      const { refusal } = await client.call(`/v2/domains/${encodeURIComponent(zone.domain)}/records`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(recordBody(record)), retry: false }, `adding a DNS record to ${zone.domain}`);
+      // Sent twice, a record would be made twice: one the zone now lists went in.
+      const landed = async () => there(await listRecords(client, zone.domain), record);
+      const { refusal } = await client.call(
+        `/v2/domains/${encodeURIComponent(zone.domain)}/records`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(recordBody(record)), landed },
+        `adding a DNS record to ${zone.domain}`,
+      );
       if (refusal) failed.push({ record, reason: refusal.message });
       else put.push(record);
     }
     if (planned.add.length > 0) {
       const listed = await listRecords(client, zone.domain);
-      const there = (record) => (listed ?? []).some((have) => recordType(have) === recordType(record) && recordName(have) === recordName(record) && sameRecord(have, record));
-      for (const item of failed.filter(({ record }) => there(record))) {
+      for (const item of failed.filter(({ record }) => there(listed, record))) {
         put.push(item.record);
         failed.splice(failed.indexOf(item), 1);
       }
-      const absent = put.filter((record) => !there(record));
+      const absent = put.filter((record) => !there(listed, record));
       if (absent.length > 0) throw new StepError(`${zone.domain} does not list ${absent.map((record) => label(zone.domain, record)).join("; ")} after adding ${absent.length === 1 ? "it" : "them"}.`);
     }
     addedRecords += put.length;
@@ -368,6 +399,9 @@ export async function rebuildVercelSettings({ archive, project, team, token, wor
       later(`These DNS records in ${zone.domain} changed since the backup, so the zone's are kept and the copy's were not added: ${planned.changed.join(", ")}. Check they point at the new project.`);
     }
     if (planned.byHand.length > 0) later(`Add these DNS records to ${zone.domain} by hand, since Vercel takes their parts separately: ${planned.byHand.join("; ")}.`);
+    if (planned.tooLong.length > 0) {
+      later(`The backup kept these DNS records of ${zone.domain} without their values, which were too long to keep, so they were not sent to Vercel. Add them by hand if the zone does not have them already: ${planned.tooLong.join("; ")}.`);
+    }
     if (failed.length > 0) {
       later(`Vercel did not add these DNS records: ${failed.map(({ record, reason }) => `${label(zone.domain, record)} (${reason})`).join("; ")}. Add them by hand, or run this again: the records already added are kept.`);
     }

@@ -40,7 +40,7 @@ exit 0
   for (const tool of ["pg_dump", "aws", "pg_restore"]) chmodSync(path.join(dir, tool), 0o755);
 }
 
-async function backup(message, { dumps = false } = {}) {
+async function backup(message, { dumps = false, env = {} } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "lg-dump-errors-"));
   fakeTools(dir, message, dumps);
   const work = path.join(dir, "work");
@@ -74,6 +74,7 @@ async function backup(message, { dumps = false } = {}) {
           CHECKIN_SECRET: "unit-test-checkin-secret",
           CHECKIN_URL: `http://127.0.0.1:${server.address().port}/checkin`,
           LIFEBOAT_WORKDIR: work,
+          ...env,
         },
       });
       let stderr = "";
@@ -132,4 +133,30 @@ test("a warning from a dump that worked is printed and doesn't fail the night", 
   assert.equal(run.status, 0, run.stderr);
   assert.match(run.stderr, /pg_dump: warning: there are circular foreign-key constraints/);
   assert.equal(JSON.parse(run.bodies[0]).ok, true);
+});
+
+const POOLER = (ref) => `postgresql://lastgood_backup.${ref}:Pw9fakeNotRealX@aws-0-ap-southeast-2.pooler.supabase.com:5432/postgres`;
+
+test("a DATABASE_URL for another Supabase project stops the night before pg_dump, and says which", async () => {
+  const run = await backup("pg_dump ran", { dumps: true, env: { DATABASE_URL: POOLER("zyxwvutsrqponmlkjihg") } });
+  assert.equal(run.status, 1);
+  assert.doesNotMatch(run.stderr, /pg_dump ran/);
+  assert.equal(run.bodies.length, 1);
+  const checkin = JSON.parse(run.bodies[0]);
+  assert.equal(checkin.ok, false);
+  assert.equal(
+    checkin.error,
+    "DATABASE_URL signs in to the Supabase project zyxwvutsrqponmlkjihg, but this repository backs up abcdefghijklmnopqrst, so nothing was copied. Connect the repository again from LastGood, or put back the DATABASE_URL it wrote.",
+  );
+  assert.ok(checkin.error.length <= 300, `${checkin.error.length}`);
+  assert.doesNotMatch(run.bodies[0], /Pw9fakeNotRealX|pooler\.supabase\.com/);
+});
+
+test("a DATABASE_URL for this project, or a project name that isn't a ref, backs up as before", async () => {
+  for (const env of [{ DATABASE_URL: POOLER("abcdefghijklmnopqrst") }, { DATABASE_URL: POOLER("zyxwvutsrqponmlkjihg"), LIFEBOAT_PROJECT: "my-shop" }]) {
+    const run = await backup("pg_dump ran", { dumps: true, env });
+    assert.equal(run.status, 0, run.stderr);
+    assert.match(run.stderr, /pg_dump ran/);
+    assert.equal(JSON.parse(run.bodies[0]).ok, true, JSON.stringify(env.LIFEBOAT_PROJECT));
+  }
 });

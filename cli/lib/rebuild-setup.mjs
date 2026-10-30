@@ -3,7 +3,7 @@ import { mkdir, readdir, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import { checkSetup, PROJECT_REF, SECRET_FIELD, secretAuthField, SetupError } from "./lifeboat/supabase-setup.mjs";
 import { clean } from "./rebuild-list.mjs";
-import { checkArchive, counted, run, StepError } from "./rebuild.mjs";
+import { checkArchive, counted, holds, noAnswer, run, StepError, timeLimit } from "./rebuild.mjs";
 
 /**
  * Edge Functions and Supabase settings back into a new project (R4), from the setup copy (B7), on the customer's own
@@ -142,50 +142,83 @@ function defaultSleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Management API calls for one project: retried on a network error, 429 or 5xx; a refused token stops the step. */
-function managementClient({ api, ref, token, fetchImpl, sleep }) {
+/**
+ * Management API calls for one project, each with a time limit; a refused token stops the step. A read is tried again
+ * on a network error, no answer in time, a 429 or a 5xx. A write is sent again as it is only after a 429, which
+ * Supabase sends before taking anything. When its answer is lost or a 5xx, the write may have gone in, so `landed`
+ * reads back whether it did, and it is sent again only if not. A write with no way to read it back is sent once.
+ */
+function managementClient({ api, ref, token, fetchImpl, sleep, limit = timeLimit }) {
   const base = `${(api || DEFAULT_API).replace(/\/+$/, "")}/v1/projects/${ref}`;
   const hide = (text) => clean(String(text).split(token).join("…"));
 
-  async function call(pathname, init, what) {
+  /** `bytes` is how much the call sends, which sets its time limit. */
+  async function call(pathname, init, what, { bytes = 0, landed } = {}) {
+    const write = Boolean(init?.method);
     let last = null;
     for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
       let response;
+      const ms = limit(bytes);
       try {
-        response = await fetchImpl(`${base}${pathname}`, { ...init, headers: { Authorization: `Bearer ${token}`, "User-Agent": "lastgood-cli", ...(init?.headers ?? {}) } });
-      } catch {
-        last = { status: 0, message: "Supabase could not be reached" };
-        if (attempt < ATTEMPTS) await sleep(1000 * 2 ** (attempt - 1));
-        continue;
+        response = await fetchImpl(`${base}${pathname}`, {
+          ...init,
+          headers: { Authorization: `Bearer ${token}`, "User-Agent": "lastgood-cli", ...(init?.headers ?? {}) },
+          signal: AbortSignal.timeout(ms),
+        });
+      } catch (error) {
+        last = { status: 0, message: noAnswer(error, ms, "Supabase"), unsure: true };
       }
-      if (response.ok) return { response };
-      let message = "";
-      try {
-        const body = await response.json();
-        message = typeof body?.message === "string" ? body.message : typeof body?.error === "string" ? body.error : "";
-      } catch {
-        message = "";
+      if (response?.ok) return { response };
+      if (response) {
+        let message = "";
+        try {
+          const body = await response.json();
+          message = typeof body?.message === "string" ? body.message : typeof body?.error === "string" ? body.error : "";
+        } catch {
+          message = "";
+        }
+        if (response.status === 401) throw new StepError(`Supabase refused the token in LASTGOOD_SUPABASE_TOKEN when ${what}. Make an access token with write access to the new project.`);
+        const refusal = { status: response.status, message: hide(message || `HTTP ${response.status}`) };
+        if (response.status < 500 && response.status !== 429) return { refusal };
+        last = { ...refusal, unsure: response.status !== 429 };
       }
-      const refusal = { status: response.status, message: hide(message || `HTTP ${response.status}`) };
-      if (response.status === 401) throw new StepError(`Supabase refused the token in LASTGOOD_SUPABASE_TOKEN when ${what}. Make an access token with write access to the new project.`);
-      if (response.status < 500 && response.status !== 429) return { refusal };
-      last = refusal;
-      if (attempt < ATTEMPTS) await sleep(waitFor(response, attempt));
+      if (attempt === ATTEMPTS || (write && last.unsure && !landed)) break;
+      await sleep(response ? waitFor(response, attempt) : 1000 * 2 ** (attempt - 1));
+      if (write && last.unsure && (await landed())) return { landed: true };
     }
-    return { refusal: last };
+    // A write whose last try may have gone in is looked for once more before it counts as refused.
+    if (write && last.unsure && landed && (await landed())) return { landed: true };
+    return { refusal: { status: last.status, message: last.message } };
   }
 
+  /** A read's whole answer as JSON. One cut off, or stalled past its time limit, after it began is asked for again. */
   async function json(pathname, init, what) {
-    const { response, refusal } = await call(pathname, init, what);
-    if (refusal) throw new StepError(`Supabase would not answer when ${what}: ${refusal.message}.`);
-    try {
-      return await response.json();
-    } catch {
-      throw new StepError(`Supabase sent something other than JSON when ${what}.`);
+    for (let attempt = 1; ; attempt += 1) {
+      const { response, refusal } = await call(pathname, init, what);
+      if (refusal) throw new StepError(`Supabase would not answer when ${what}: ${refusal.message}.`);
+      let text;
+      try {
+        text = await response.text();
+      } catch {
+        if (attempt >= ATTEMPTS) throw new StepError(`Supabase's answer was cut off when ${what}.`);
+        await sleep(1000 * 2 ** (attempt - 1));
+        continue;
+      }
+      try {
+        return JSON.parse(text);
+      } catch {
+        throw new StepError(`Supabase sent something other than JSON when ${what}.`);
+      }
     }
   }
 
   return { call, json };
+}
+
+/** The slugs of the functions the new project has. */
+async function functionSlugs(client, what) {
+  const listed = await client.json("/functions", { headers: { Accept: "application/json" } }, what);
+  return new Set((Array.isArray(listed) ? listed : []).map((fn) => fn?.slug).filter(Boolean));
 }
 
 async function readJson(file, what) {
@@ -209,6 +242,8 @@ function entrypointPath(value) {
 /** Deploys one function from the copy. Null when it went in, else the refusal. */
 async function deploy(client, dir, fn) {
   const slug = fn.slug;
+  // Only a function the new project lacked is deployed, so finding it listed means this deploy went in.
+  const landed = async () => (await functionSlugs(client, `checking whether the ${slug} function went in`)).has(slug);
   const fnDir = path.join(dir, "functions", slug);
   const source = await readJson(path.join(fnDir, "source.json"), `The source of the ${slug} function`);
   const fromSource = source.metadata && typeof source.metadata === "object" ? source.metadata : {};
@@ -222,7 +257,10 @@ async function deploy(client, dir, fn) {
     if (entrypoint) params.set("entrypoint_path", entrypoint);
     if (importMap) params.set("import_map_path", importMap);
     const body = await readFile(path.join(fnDir, "body.eszip"));
-    const { refusal } = await client.call(`/functions?${params}`, { method: "POST", headers: { "Content-Type": "application/vnd.denoland.eszip" }, body }, `deploying the ${slug} function`);
+    const { refusal } = await client.call(`/functions?${params}`, { method: "POST", headers: { "Content-Type": "application/vnd.denoland.eszip" }, body }, `deploying the ${slug} function`, {
+      bytes: body.length,
+      landed,
+    });
     return refusal ?? null;
   }
   const metadata = { entrypoint_path: entrypoint, name, verify_jwt: verifyJwt };
@@ -230,10 +268,13 @@ async function deploy(client, dir, fn) {
   if (Array.isArray(fromSource.static_patterns)) metadata.static_patterns = fromSource.static_patterns;
   const form = new FormData();
   form.append("metadata", JSON.stringify(metadata));
+  let bytes = 0;
   for (const file of source.files) {
-    form.append("file", new Blob([await readFile(path.join(fnDir, ...file.saved.split("/")))]), file.path);
+    const bodyOf = await readFile(path.join(fnDir, ...file.saved.split("/")));
+    bytes += bodyOf.length;
+    form.append("file", new Blob([bodyOf]), file.path);
   }
-  const { refusal } = await client.call(`/functions/deploy?${new URLSearchParams({ slug })}`, { method: "POST", body: form }, `deploying the ${slug} function`);
+  const { refusal } = await client.call(`/functions/deploy?${new URLSearchParams({ slug })}`, { method: "POST", body: form }, `deploying the ${slug} function`, { bytes, landed });
   return refusal ?? null;
 }
 
@@ -255,13 +296,15 @@ async function functionText(dir) {
 async function patchEach(client, pathname, change, what) {
   const refused = [];
   if (Object.keys(change).length === 0) return { applied: [], refused };
-  const whole = await client.call(pathname, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(change) }, `changing ${what}`);
+  // A change read back as set went in, whatever happened to its answer.
+  const landed = (sent) => async () => holds(await client.json(pathname, { headers: { Accept: "application/json" } }, `checking ${what}`), sent);
+  const whole = await client.call(pathname, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(change) }, `changing ${what}`, { landed: landed(change) });
   if (!whole.refusal) return { applied: Object.keys(change), refused };
   const applied = [];
   for (const [field, value] of Object.entries(change)) {
     const parts = field === "features" ? Object.entries(value).map(([name, feature]) => [`features.${name}`, { features: { [name]: feature } }]) : [[field, { [field]: value }]];
     for (const [label, body] of parts) {
-      const one = await client.call(pathname, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, `changing ${what}`);
+      const one = await client.call(pathname, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, `changing ${what}`, { landed: landed(body) });
       if (one.refusal) refused.push(`${label} (${one.refusal.message})`);
       else applied.push(label);
     }
@@ -273,9 +316,9 @@ async function patchEach(client, pathname, change, what) {
  * Deploys the setup copy's Edge Functions into a new project and applies its auth, third-party auth and storage
  * settings, then lists what the customer sets by hand.
  */
-export async function rebuildSetup({ archive, ref, token, work, say, todo = say, api, fetchImpl = fetch, sleep = defaultSleep }) {
+export async function rebuildSetup({ archive, ref, token, work, say, todo = say, api, fetchImpl = fetch, sleep = defaultSleep, limit = timeLimit }) {
   const secret = checkToken(token);
-  const client = managementClient({ api, ref, token: secret, fetchImpl, sleep });
+  const client = managementClient({ api, ref, token: secret, fetchImpl, sleep, limit });
 
   const dir = path.join(work, "setup");
   await rm(dir, { recursive: true, force: true });
@@ -379,7 +422,12 @@ export async function rebuildSetup({ archive, ref, token, work, say, todo = say,
     const body = {};
     for (const field of ["oidc_issuer_url", "jwks_url", "custom_jwks"]) if (item?.[field]) body[field] = item[field];
     if (Object.keys(body).length === 0) continue;
-    const { refusal } = await client.call("/config/auth/third-party-auth", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, "adding third-party auth");
+    // Sent twice, an integration would be added twice: one the new project now lists went in.
+    const landed = async () => {
+      const now = await client.json("/config/auth/third-party-auth", { headers: { Accept: "application/json" } }, "checking third-party auth");
+      return (Array.isArray(now) ? now : []).some((have) => identity(have) === id);
+    };
+    const { refusal } = await client.call("/config/auth/third-party-auth", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, "adding third-party auth", { landed });
     if (refusal) notApplied.push(`third-party auth ${item?.oidc_issuer_url || item?.jwks_url || "with its own keys"} (${refusal.message})`);
     else added += 1;
   }

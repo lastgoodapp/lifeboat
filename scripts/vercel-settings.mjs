@@ -79,6 +79,8 @@ export function projectSettings(raw) {
   const settings = pick(raw, PROJECT_FIELDS);
   if (isObject(raw.resourceConfig)) settings.resourceConfig = pick(raw.resourceConfig, RESOURCE_FIELDS);
   if (isObject(raw.ssoProtection)) settings.ssoProtection = pick(raw.ssoProtection, SSO_FIELDS);
+  // null is Vercel Authentication switched off. Kept, so a rebuild can say the old project was open to anyone.
+  else if (raw.ssoProtection === null) settings.ssoProtection = null;
   if (isObject(raw.link)) {
     settings.link = pick(raw.link, LINK_FIELDS);
     if (Array.isArray(raw.link.deployHooks)) settings.link.deployHooks = raw.link.deployHooks.filter(isObject).map((hook) => pick(hook, DEPLOY_HOOK_FIELDS));

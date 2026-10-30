@@ -63,9 +63,13 @@ inputs:
     required: false
     default: "30"
   monthly-copies:
-    description: When true, the first good backup of each UTC month is also copied to <prefix>/monthly/<YYYYMM>/ and kept for twelve months. Needs manage-retention true. Off by default. A repository variable, LIFEBOAT_MONTHLY_COPIES.
+    description: When true, the first good backup of each UTC month is also copied to <prefix>/monthly/<YYYYMM>/ and kept for twelve months. On your own bucket it needs manage-retention true. On LastGood's storage it needs monthly-bucket. Off by default. A repository variable, LIFEBOAT_MONTHLY_COPIES.
     required: false
     default: "false"
+  monthly-bucket:
+    description: LastGood's storage only. The region's monthly-copies bucket, which keeps each copy twelve months under its own lock. LastGood writes it as the LIFEBOAT_MONTHLY_BUCKET variable where your region has one. The month's first good backup is copied there from the nightly bucket.
+    required: false
+    default: ""
   storage-login:
     description: The storage login LastGood makes when you connect, the LIFEBOAT_STORAGE_LOGIN secret. Each backup signs in with it through Supabase's Storage API and copies every bucket. Its storage policies let it read every file and never add, change or delete one.
     required: false
@@ -211,6 +215,7 @@ runs:
         LIFEBOAT_MANAGE_RETENTION: ${{ inputs.manage-retention }}
         RETENTION_DAYS: ${{ inputs.retention-days }}
         LIFEBOAT_MONTHLY_COPIES: ${{ inputs.monthly-copies }}
+        LIFEBOAT_MONTHLY_BUCKET: ${{ inputs.monthly-bucket }}
         LIFEBOAT_STORAGE_LOGIN: ${{ inputs.storage-login }}
         SUPABASE_PUBLISHABLE_KEY: ${{ inputs.supabase-publishable-key }}
         STORAGE_S3_ENDPOINT: ${{ inputs.storage-s3-endpoint }}
@@ -226,4 +231,5 @@ runs:
         LIFEBOAT_VERCEL_TOKEN: ${{ inputs.vercel-token }}
         VERCEL_PROJECT_ID: ${{ inputs.vercel-project-id }}
         VERCEL_TEAM_ID: ${{ inputs.vercel-team-id }}
-      run: bash "$GITHUB_ACTION_PATH/scripts/run.sh"
+      # exec: run.sh is the step's process, so a cancel or time out signals it, and it reports the run as stopped.
+      run: exec bash "$GITHUB_ACTION_PATH/scripts/run.sh"

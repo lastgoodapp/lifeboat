@@ -158,6 +158,39 @@ test("a list left in the work folder by an earlier run is never reported, and a 
   assert.deepEqual(failed.checkins[0].copies, []);
 });
 
+/** Every path under dir, so a failure shows what was left behind. */
+function leftovers(dir) {
+  return readdirSync(dir, { recursive: true }).sort();
+}
+
+test("the work folder Lifeboat makes, plain dump and all, is gone after the check-in, on a good night and a failed one", async () => {
+  const good = mkdtempSync(path.join(tmpdir(), "lg-copies-tmp-"));
+  const run = await backup({ extra: { LIFEBOAT_WORKDIR: "", TMPDIR: good } });
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(run.checkins[0].copies.length, 1, "the check-in read the copies list before the folder went");
+  assert.deepEqual(leftovers(good), []);
+
+  // The upload fails after pg_dump has written the plain dump, so the night ends with it on disk.
+  const failed = mkdtempSync(path.join(tmpdir(), "lg-copies-tmp-"));
+  const upload = await backup({
+    extra: { LIFEBOAT_WORKDIR: "", TMPDIR: failed },
+    before: (work) => {
+      const dir = path.dirname(work);
+      writeFileSync(path.join(dir, "aws-real"), readFileSync(path.join(dir, "aws")));
+      chmodSync(path.join(dir, "aws-real"), 0o755);
+      writeFileSync(path.join(dir, "aws"), `#!/bin/sh\ncase " $* " in *" s3 cp "*) echo "upload failed" >&2; exit 1 ;; esac\nexec "${dir}/aws-real" "$@"\n`);
+    },
+  });
+  assert.notEqual(upload.status, 0);
+  assert.equal(upload.checkins[0].ok, false);
+  assert.deepEqual(leftovers(failed), []);
+
+  // A folder the caller names is the caller's, and stays.
+  const named = await backup({ before: (work) => writeFileSync(path.join(work, "mine.txt"), "kept") });
+  assert.equal(named.status, 0, named.stderr);
+  assert.equal(readFileSync(path.join(named.dir, "work", "mine.txt"), "utf8"), "kept");
+});
+
 test("the log warns when LastGood records fewer copies than the backup reported, and stays quiet when it records them all", async () => {
   const short = await backup({ answer: JSON.stringify({ ok: true, emailed: false, copies: { reported: 1, recorded: 0 } }) });
   assert.equal(short.status, 0, short.stderr);

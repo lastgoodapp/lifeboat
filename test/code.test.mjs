@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { CALL_TIMEOUT_MS, exportMetadata, LISTS, nextLink } from "../scripts/github-metadata.mjs";
+import { CALL_TIMEOUT_MS, countMetadata, exportMetadata, LISTS, nextLink } from "../scripts/github-metadata.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
 const RUN = path.join(ROOT, "scripts", "run.sh");
@@ -62,6 +62,7 @@ function fakeFetch(routes, seen = []) {
     if (!answer) return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
     const headers = new Headers({ "content-type": "application/json" });
     if (answer.link) headers.set("link", answer.link);
+    for (const [name, value] of Object.entries(answer.headers ?? {})) headers.set(name, value);
     return new Response(JSON.stringify(answer.body), { status: answer.status, headers });
   };
 }
@@ -114,6 +115,38 @@ test("issues switched off give an empty list and a note, not a failure", async (
   assert.match(notes[0], /switched off/);
 });
 
+test("with Issues switched off, pull requests' conversation comments are read one pull request at a time, or the copy fails by name", async () => {
+  const off = { status: 410, body: { message: "Issues are disabled for this repo" } };
+  const onePull = (number) => `${BASE}/issues/${number}/comments?per_page=100`;
+  const routes = {
+    [BASE]: { status: 200, body: { full_name: REPO } },
+    [url("issues")]: off,
+    [url("issues/comments")]: off,
+    [url("pulls")]: page([{ number: 2 }, { number: 3 }]),
+    [url("pulls/comments")]: page([{ id: 9 }]),
+    [onePull(2)]: page([{ id: 20, body: "Looks good" }], `${onePull(2)}&page=2`),
+    [`${onePull(2)}&page=2`]: page([{ id: 21, body: "Merging" }]),
+    [onePull(3)]: page([{ id: 30, body: "Needs a test" }]),
+  };
+  const dir = mkdtempSync(path.join(tmpdir(), "lg-meta-"));
+  const notes = [];
+  const counts = await exportMetadata({ api: API, repository: REPO, token: TOKEN, dir, fetchImpl: fakeFetch(routes), sleep: async () => {}, note: (line) => notes.push(line) });
+  assert.deepEqual(counts, { issues: 0, pullRequests: 2, comments: 4 });
+  assert.deepEqual(
+    JSON.parse(readFileSync(path.join(dir, "issue-comments.json"), "utf8")).map((comment) => comment.id),
+    [20, 21, 30],
+  );
+  assert.deepEqual(countMetadata(dir), counts, "a restore reads the same counts back");
+  assert.ok(notes.some((line) => /conversation comments were read one pull request at a time/.test(line)), notes.join("\n"));
+
+  const refused = { ...routes, [onePull(3)]: off };
+  await assert.rejects(
+    exportMetadata({ api: API, repository: REPO, token: TOKEN, dir: mkdtempSync(path.join(tmpdir(), "lg-meta-")), fetchImpl: fakeFetch(refused), sleep: async () => {} }),
+    (error) =>
+      error.message === "The pull requests' conversation comments could not be copied: Issues is switched off for acme/notes, and GitHub keeps those comments under Issues.",
+  );
+});
+
 test("a token without issues: read names the missing permission, and never the token", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "lg-meta-"));
   const routes = {
@@ -145,6 +178,108 @@ test("a server error is retried, and a rate limit is named", async () => {
     /rate limit/,
   );
   await assert.rejects(exportMetadata({ api: API, repository: "not a repo", token: TOKEN, dir }), /owner\/repo/);
+});
+
+test("issues left on give no note, and pull requests are counted from their own list", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "lg-meta-"));
+  const notes = [];
+  const routes = {
+    [BASE]: { status: 200, body: { full_name: REPO } },
+    [url("issues")]: page([{ number: 1 }, { number: 2, pull_request: {} }, { number: 3, pull_request: {} }]),
+    [url("issues/comments")]: page([{ id: 1 }]),
+    [url("pulls")]: page([{ number: 2 }, { number: 3 }]),
+    [url("pulls/comments")]: page([{ id: 7 }, { id: 8 }, { id: 9 }, { id: 10 }]),
+  };
+  const counts = await exportMetadata({ api: API, repository: REPO, token: TOKEN, dir, fetchImpl: fakeFetch(routes), sleep: async () => {}, note: (line) => notes.push(line) });
+  assert.deepEqual(counts, { issues: 1, pullRequests: 2, comments: 5 });
+  assert.deepEqual(notes, []);
+  // Read back the way a restore reads the folder, the same counts come out.
+  assert.deepEqual(countMetadata(dir), counts);
+});
+
+test("a rate limit is waited out and tried again, a refusal is not, and no wait follows the last try", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "lg-meta-"));
+  const empty = { [url("issues")]: page([]), [url("issues/comments")]: page([]), [url("pulls")]: page([]), [url("pulls/comments")]: page([]) };
+  let tries = 0;
+  const limited = { ...empty, [BASE]: () => (++tries < 2 ? { status: 429, body: { message: "Too Many Requests" } } : { status: 200, body: {} }) };
+  const sleeps = [];
+  await exportMetadata({ api: API, repository: REPO, token: TOKEN, dir, fetchImpl: fakeFetch(limited), sleep: async (ms) => void sleeps.push(ms) });
+  assert.equal(tries, 2);
+  assert.deepEqual(sleeps, [1000]);
+
+  const seen = [];
+  const missing = { [BASE]: { status: 404, body: { message: "Not Found" } } };
+  await assert.rejects(exportMetadata({ api: API, repository: REPO, token: TOKEN, dir, fetchImpl: fakeFetch(missing, seen), sleep: async () => {} }));
+  assert.equal(seen.length, 1);
+
+  for (const fetchImpl of [fakeFetch({ [BASE]: { status: 502, body: { message: "Bad Gateway" } } }), async () => Promise.reject(new TypeError("fetch failed"))]) {
+    const waits = [];
+    await assert.rejects(exportMetadata({ api: API, repository: REPO, token: TOKEN, dir, fetchImpl, sleep: async (ms) => void waits.push(ms) }));
+    assert.deepEqual(waits, [1000, 2000]);
+  }
+});
+
+test("a rate limit waits as long as GitHub asks, up to a minute, a secondary limit's 403 included, and is named when it lasts", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "lg-meta-"));
+  const empty = { [url("issues")]: page([]), [url("issues/comments")]: page([]), [url("pulls")]: page([]), [url("pulls/comments")]: page([]) };
+  const limitedThen = (answers) => {
+    let tries = 0;
+    return { ...empty, [BASE]: () => answers[tries++] ?? { status: 200, body: {} } };
+  };
+  const secondary = { status: 403, body: { message: "You have exceeded a secondary rate limit. Please wait a few minutes before you try again." }, headers: { "retry-after": "30" } };
+  const sleeps = [];
+  await exportMetadata({
+    api: API,
+    repository: REPO,
+    token: TOKEN,
+    dir,
+    fetchImpl: fakeFetch(limitedThen([secondary, { status: 429, body: { message: "Too Many Requests" }, headers: { "retry-after": "600" } }])),
+    sleep: async (ms) => void sleeps.push(ms),
+  });
+  assert.deepEqual(sleeps, [30_000, 60_000], "Retry-After is kept, and capped at a minute");
+
+  const always = { ...empty, [BASE]: { status: 429, body: { message: "Too Many Requests" } } };
+  await assert.rejects(
+    exportMetadata({ api: API, repository: REPO, token: TOKEN, dir, fetchImpl: fakeFetch(always), sleep: async () => {} }),
+    (error) => error.message === "GitHub's rate limit stopped the copy of the repository. The next run tries again.",
+  );
+});
+
+test("a list takes 1,000 pages and refuses a 1,001st", async () => {
+  const pagesOf = (count) => {
+    const routes = {
+      [BASE]: { status: 200, body: { full_name: REPO } },
+      [url("issues")]: page([{ number: 0 }], `${BASE}/issues?page=1`),
+      [url("issues/comments")]: page([]),
+      [url("pulls")]: page([]),
+      [url("pulls/comments")]: page([]),
+    };
+    for (let n = 1; n < count; n += 1) routes[`${BASE}/issues?page=${n}`] = page([{ number: n }], n + 1 < count ? `${BASE}/issues?page=${n + 1}` : undefined);
+    return fakeFetch(routes);
+  };
+  const dir = mkdtempSync(path.join(tmpdir(), "lg-meta-"));
+  const counts = await exportMetadata({ api: API, repository: REPO, token: TOKEN, dir, fetchImpl: pagesOf(1000), sleep: async () => {} });
+  assert.equal(counts.issues, 1000);
+  await assert.rejects(
+    exportMetadata({ api: API, repository: REPO, token: TOKEN, dir, fetchImpl: pagesOf(1001), sleep: async () => {} }),
+    /issues\.json has more than 100000 entries/,
+  );
+});
+
+test("a copy whose repository.json or a list is damaged or missing does not read back", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "lg-meta-"));
+  const write = (file, value) => writeFileSync(path.join(dir, file), typeof value === "string" ? value : JSON.stringify(value));
+  for (const list of LISTS) write(list.file, []);
+  for (const repository of [null, [], "repo", 7]) {
+    write("repository.json", JSON.stringify(repository));
+    assert.throws(() => countMetadata(dir), /repository\.json in the code copy is not a repository/, JSON.stringify(repository));
+  }
+  write("repository.json", { full_name: REPO });
+  assert.deepEqual(countMetadata(dir), { issues: 0, pullRequests: 0, comments: 0 });
+  write("pulls.json", { not: "a list" });
+  assert.throws(() => countMetadata(dir), /pulls\.json in the code copy is not a list/);
+  write("pulls.json", "{");
+  assert.throws(() => countMetadata(dir), /pulls\.json in the code copy did not read back/);
 });
 
 function fakeTools(dir) {
@@ -266,7 +401,7 @@ async function backupWithCode(answers, extra = {}) {
       GITHUB_SERVER_URL: `file://${path.join(dir, "server")}`,
       GITHUB_API_URL: `http://127.0.0.1:${api.port}`,
       GITHUB_TOKEN: TOKEN,
-      ...extra,
+      ...(typeof extra === "function" ? extra(api.port) : extra),
     });
     return { ...result, dir, uploads, keyFile, work, checkins: api.checkins };
   } finally {
@@ -329,6 +464,34 @@ test("a workflow without issues: read fails the run by name, after the database 
   assert.equal(run.checkins[0].ok, false);
   assert.match(run.checkins[0].error, /issues: read/);
   assert.ok(!run.stderr.includes(TOKEN));
+  assert.match(run.stderr, /The users check still runs; then this run fails\./, "the code part fails alone");
+  assert.equal(run.checkins[0].codeBranches, null, "no counts for a code copy that never went up");
+  assert.equal(run.checkins[0].codeTags, null);
+  assert.equal(run.checkins[0].codeBytes, null);
+});
+
+test("a clone that cannot reach GitHub says so, not that a permission is missing, and the rest of the night still runs", async () => {
+  const run = await backupWithCode(GOOD_API, { GITHUB_SERVER_URL: "http://127.0.0.1:9" });
+  assert.notEqual(run.status, 0);
+  assert.equal(
+    run.checkins[0].error,
+    "git could not reach GitHub to copy acme/notes, or GitHub didn't answer. The next run tries again. Nothing was uploaded for the code.",
+  );
+  assert.doesNotMatch(run.checkins[0].error, /contents: read/);
+  assert.match(run.stderr, /Failed to connect/, "git's own message stays in the log");
+  assert.match(run.stderr, /The users check still runs; then this run fails\./);
+  assert.equal(readdirSync(path.join(run.uploads, "lifeboat", "db")).length, 1, "the database copy still went up");
+  assert.equal(existsSync(path.join(run.uploads, "lifeboat", "repo")), false);
+  assert.equal(existsSync(path.join(run.work, "code")), false, "nothing of the clone is left behind");
+  assert.equal(run.checkins[0].codeBranches, null);
+});
+
+test("a token GitHub refuses when cloning over HTTP still names the permission", async () => {
+  // The fake answers 401 to anything not sent with the bearer token, as GitHub does to a token without contents: read.
+  const run = await backupWithCode(GOOD_API, (port) => ({ GITHUB_SERVER_URL: `http://127.0.0.1:${port}` }));
+  assert.notEqual(run.status, 0);
+  assert.equal(run.checkins[0].error, "git could not read acme/notes with the workflow's token. The workflow needs contents: read under permissions. Nothing was uploaded for the code.");
+  assert.ok(!run.stderr.includes(TOKEN) && !shown(run.stdout).includes(TOKEN));
 });
 
 test("a token git cannot use fails the run without printing it", async () => {
@@ -387,4 +550,72 @@ test("a GitHub call that never answers is given up after a minute and tried agai
   assert.equal(stuck.calls(), 3);
   assert.deepEqual(stuck.limits(), [CALL_TIMEOUT_MS, CALL_TIMEOUT_MS, CALL_TIMEOUT_MS]);
   assert.equal(CALL_TIMEOUT_MS, 60_000);
+});
+
+test("a refusal GitHub sends without JSON is still explained, and a token GitHub refuses is named", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "lg-meta-"));
+  const answering = (status, text) => async () => new Response(text, { status, headers: { "content-type": "text/html" } });
+  await assert.rejects(
+    exportMetadata({ api: API, repository: REPO, token: TOKEN, dir, fetchImpl: answering(401, "<html>Bad credentials</html>"), sleep: async () => {} }),
+    (error) => error.message === "GitHub did not accept the workflow's token.",
+  );
+  await assert.rejects(
+    exportMetadata({ api: API, repository: REPO, token: TOKEN, dir, fetchImpl: answering(502, "<html>Bad Gateway</html>"), sleep: async () => {} }),
+    (error) => error.message === "GitHub answered 502 when reading the repository.",
+  );
+  const refused = { [BASE]: { status: 401, body: { message: "Bad credentials", documentation_url: "https://docs.github.com/rest" } } };
+  await assert.rejects(
+    exportMetadata({ api: API, repository: REPO, token: TOKEN, dir, fetchImpl: fakeFetch(refused), sleep: async () => {} }),
+    (error) => error.message === "GitHub did not accept the workflow's token.",
+  );
+});
+
+test("without a sleep given, a server error waits a second on the clock before GitHub is asked again", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const dir = mkdtempSync(path.join(tmpdir(), "lg-meta-"));
+  let tries = 0;
+  const routes = {
+    [BASE]: () => (++tries < 2 ? { status: 502, body: { message: "Bad Gateway" } } : { status: 200, body: {} }),
+    [url("issues")]: page([]),
+    [url("issues/comments")]: page([]),
+    [url("pulls")]: page([]),
+    [url("pulls/comments")]: page([]),
+  };
+  const settle = async () => {
+    for (let round = 0; round < 10; round += 1) await new Promise((resolve) => setImmediate(resolve));
+  };
+  const copy = exportMetadata({ api: API, repository: REPO, token: TOKEN, dir, fetchImpl: fakeFetch(routes) });
+  await settle();
+  assert.equal(tries, 1);
+  t.mock.timers.tick(999);
+  await settle();
+  assert.equal(tries, 1, "not asked again before the second is up");
+  t.mock.timers.tick(1);
+  assert.deepEqual(await copy, { issues: 0, pullRequests: 0, comments: 0 });
+  assert.equal(tries, 2);
+});
+
+test("github-metadata.mjs --count reads a folder back and prints its counts, and an unexpected failure prints no detail", async () => {
+  const script = path.join(ROOT, "scripts", "github-metadata.mjs");
+  const dir = mkdtempSync(path.join(tmpdir(), "lg-meta-"));
+  const routes = {
+    [BASE]: { status: 200, body: { full_name: REPO } },
+    [url("issues")]: page([{ number: 1 }, { number: 2, pull_request: {} }]),
+    [url("issues/comments")]: page([{ id: 1 }]),
+    [url("pulls")]: page([{ number: 2 }]),
+    [url("pulls/comments")]: page([{ id: 7 }, { id: 8 }]),
+  };
+  await exportMetadata({ api: API, repository: REPO, token: TOKEN, dir, fetchImpl: fakeFetch(routes), sleep: async () => {} });
+  assert.equal(execFileSync(process.execPath, [script, "--count", dir], { encoding: "utf8", env: { PATH: process.env.PATH } }), "1 1 3\n");
+
+  // A folder that cannot be made, under a file, is not a MetadataError: the run's log gets the plain line, not Node's.
+  const file = path.join(mkdtempSync(path.join(tmpdir(), "lg-meta-")), "not-a-folder");
+  writeFileSync(file, "");
+  const failed = spawnSync(process.execPath, [script, path.join(file, "github")], {
+    encoding: "utf8",
+    env: { PATH: process.env.PATH, GITHUB_REPOSITORY: REPO, GITHUB_TOKEN: TOKEN, GITHUB_API_URL: "http://127.0.0.1:9" },
+  });
+  assert.equal(failed.status, 1);
+  assert.equal(failed.stderr, "The GitHub metadata copy failed.\n");
+  assert.equal(failed.stdout, "");
 });

@@ -129,11 +129,11 @@ const NO_VERCEL =
 
 async function rebuild(values, positionals) {
   const databaseTo = values["database-to"] ?? process.env.LASTGOOD_DATABASE_TO;
-  const code = values.code ? { copy: values.code, sha256: values["code-sha256"], to: values["code-to"] } : null;
-  const database = values.database ? { copy: values.database, sha256: values["database-sha256"], to: databaseTo } : null;
-  const files = values.files ? { copy: values.files, sha256: values["files-sha256"], to: values["files-to"] } : null;
-  const setup = values.setup ? { copy: values.setup, sha256: values["setup-sha256"] } : null;
-  const vercel = values.vercel ? { copy: values.vercel, sha256: values["vercel-sha256"] } : null;
+  const code = values.code ? { copy: values.code, sha256: values["code-sha256"], flag: "--code-sha256", to: values["code-to"] } : null;
+  const database = values.database ? { copy: values.database, sha256: values["database-sha256"], flag: "--database-sha256", to: databaseTo } : null;
+  const files = values.files ? { copy: values.files, sha256: values["files-sha256"], flag: "--files-sha256", to: values["files-to"] } : null;
+  const setup = values.setup ? { copy: values.setup, sha256: values["setup-sha256"], flag: "--setup-sha256" } : null;
+  const vercel = values.vercel ? { copy: values.vercel, sha256: values["vercel-sha256"], flag: "--vercel-sha256" } : null;
   const skip = new Set(values.skip ?? []);
   if (positionals.length !== 1 || (!code && !database && !files && !setup && !vercel)) {
     process.stderr.write(`Give --code with --code-to, --database with --database-to, --files with --database, --setup, --vercel with --vercel-project, or more than one.\n\n${USAGE}`);
@@ -206,6 +206,7 @@ async function rebuild(values, positionals) {
       steps.push({
         name: "Database",
         skip: skip.has("database") ? "you said an earlier run restored it" : "",
+        again: "add --skip database: the database is back, and the step refuses a project that is not empty",
         run: (say, todo) => rebuildDatabase({ dumpPath: opened.database, to: database.to, work, say, todo }),
       });
     }
@@ -244,7 +245,13 @@ async function rebuild(values, positionals) {
       });
     }
     return runSteps(steps, undefined, undefined, { always: vercel ? ALWAYS : [NO_VERCEL, ...ALWAYS], list });
+  }).catch((error) => {
+    // Only the work folder itself fails out here: every step's error is in the summary.
+    if (!(error instanceof StepError)) throw error;
+    process.stderr.write(`${error.message}\n`);
+    return null;
   });
+  if (ok === null) return 1;
   if (values.todo) {
     try {
       await writeFile(values.todo, todoMarkdown(list), { mode: 0o600, flag: "wx" });

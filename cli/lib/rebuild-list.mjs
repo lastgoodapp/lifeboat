@@ -213,10 +213,18 @@ export function rebuildRestoreList(toc, target = {}) {
 }
 
 /**
+ * libpq's words for a connection that has ended, and FATAL, which always ends one. Every entry after it fails the same
+ * way, indexes, row-level security and policies included, so it is a restore that failed, never things to add by hand.
+ */
+const CONNECTION_LOST =
+  /^FATAL:|no connection to the server|server closed the connection unexpectedly|connection to server was lost|terminating connection|SSL SYSCALL error|SSL connection has been closed unexpectedly|could not receive data from server|could not send data to server|lost synchronization with server/i;
+
+/**
  * Sorts pg_restore's errors by the entry each came from: with --verbose it names each object before making it
- * (`creating TRIGGER "storage.objects update_objects_updated_at"`), and some versions also print `from TOC entry`.
+ * (`creating TRIGGER "storage.objects update_objects_updated_at"`), with its schema.
  * "Already exists" on a trigger, policy, publication or schema means the new project had made it already, and is fine.
- * An error on rows is a failure. Anything else is an object that did not come across, named so the customer can add it.
+ * An error on rows, or one that means the connection was lost, is a failure. Anything else is an object that did not
+ * come across, named so the customer can add it.
  */
 export function sortRestoreErrors(stderr) {
   const failed = [];
@@ -225,11 +233,9 @@ export function sortRestoreErrors(stderr) {
   let current = null;
   for (const raw of String(stderr).split("\n")) {
     const line = raw.trim();
-    const from = /^pg_restore: from TOC entry \d+; \d+ \d+ (.*)$/.exec(line);
-    if (from) {
-      current = tocEntry(`0; 0 0 ${from[1]}`);
-      continue;
-    }
+    // Before an entry's first error pg_restore also prints `from TOC entry 3900; 1255 17011 FUNCTION uses_vault() postgres`
+    // for the same entry, as kind, name and owner without the schema. It matches none of the lines below, so it is passed
+    // over: the `creating` line before it has already said which entry this is, with its schema.
     const creating = /^pg_restore: creating (.+?) "(.*)"$/.exec(line);
     if (creating) {
       current = { desc: creating[1], namespace: "-", name: creating[2] };
@@ -245,7 +251,7 @@ export function sortRestoreErrors(stderr) {
     const message = error[1].replace(/^could not execute query: /, "").replace(/^ERROR:\s+/, "");
     if (current && /already exists|is already member of publication/i.test(message) && ["TRIGGER", "POLICY", "PUBLICATION", "PUBLICATION TABLE", "SCHEMA"].includes(current.desc)) {
       already += 1;
-    } else if (!current || current.desc === "TABLE DATA" || /COPY failed|duplicate key|violates|invalid input syntax|could not connect|connection to server/i.test(message)) {
+    } else if (!current || current.desc === "TABLE DATA" || CONNECTION_LOST.test(message) || /COPY failed|duplicate key|violates|invalid input syntax|could not connect|connection to server/i.test(message)) {
       failed.push(describe(current, message));
     } else {
       notRestored.push(describe(current, message));
@@ -255,7 +261,7 @@ export function sortRestoreErrors(stderr) {
 }
 
 function describe(entry, message) {
-  // pg_restore names a COPY's table in the message itself, without a TOC line before it.
+  // An error before pg_restore names any object, such as a connection it could not make, is told by its message alone.
   if (!entry) return clean(message);
   return `${entry.desc.toLowerCase()} ${entry.namespace === "-" ? "" : `${entry.namespace}.`}${entry.name}: ${clean(message)}`;
 }

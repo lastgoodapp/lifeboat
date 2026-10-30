@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -73,6 +73,12 @@ test("the counter counts rows and non-empty values, and treats \\N and empty as 
   const none = copyCounter("encrypted_password");
   none.line("nothing here");
   assert.equal(none.result(), null);
+});
+
+test("the counter reads a counted or skip column that comes first in the COPY header", () => {
+  const counter = copyCounter("email", { column: "email", values: new Set([STORAGE_LOGIN_EMAIL]), capture: "id" });
+  for (const line of ["COPY auth.users (email, id) FROM stdin;", "a@users.test\tu1", `${STORAGE_LOGIN_EMAIL}\tu2`, "\\N\tu3", "\\."]) counter.line(line);
+  assert.deepEqual(counter.result(), { rows: 2, withValue: 1, hasColumn: true, skipped: ["u2"] });
 });
 
 test("the TOC says which auth tables came with their rows", () => {
@@ -302,6 +308,56 @@ test("an odd-named table pg_restore gives no COPY block for is still counted, so
   assert.match(lines.join(""), /a table whose name could not be read from the dump, because it could not be checked/);
 });
 
+test("an odd-named table with no COPY block adds to the tables already counted under other, not in place of them", async () => {
+  const list = "4290; 0 17700 TABLE DATA audit pgaudit_log postgres\n4291; 0 17710 TABLE DATA public Odd Name postgres\n";
+  const spawnImpl = (command, args) => {
+    if (command === "psql") return fakePsql([], () => "0 missing\n")();
+    if (args.includes("-L")) return fakeSpawn({})(command, []);
+    return fakeSpawn({ pgaudit_log: "COPY audit.pgaudit_log (id) FROM stdin;\n1\n2\n3\n\\.\n" })(command, args);
+  };
+  const totals = await skippedTableCounts({
+    toc: list,
+    skipped: { extensions: [] },
+    list,
+    dumpPath: "d",
+    pgRestore: "pg_restore",
+    psql: "psql",
+    databaseUrl: "postgres://localhost/restore",
+    spawnImpl,
+    log: () => {},
+  });
+  assert.deepEqual(totals, [{ extension: OTHER_EXTENSION, tables: 2, rows: 3 }]);
+});
+
+test("two odd-named tables that read the same in the list are both checked, each picked by its dump ID", async () => {
+  // Table notes in schema "my app", and table "app notes" in schema my: pg_restore lists both as "my app notes".
+  const list = "4291; 0 17710 TABLE DATA my app notes postgres\n4292; 0 17720 TABLE DATA my app notes postgres\n";
+  const blocks = {
+    4291: 'COPY "my app".notes (id) FROM stdin;\n1\n\\.\n',
+    4292: 'COPY my."app notes" (id) FROM stdin;\n1\n2\n\\.\n',
+  };
+  const spawnImpl = (command, args) => {
+    if (command === "psql") return fakePsql([], () => "0 missing\n1 missing\n")();
+    const asked = readFileSync(args[args.indexOf("-L") + 1], "utf8").split("\n").filter(Boolean);
+    return fakeSpawn({ "": asked.map((line) => blocks[line.split(";")[0]]).join("") })(command, ["-t", ""]);
+  };
+  const lines = [];
+  const totals = await skippedTableCounts({
+    toc: list,
+    skipped: { extensions: [] },
+    list,
+    dumpPath: "d",
+    pgRestore: "pg_restore",
+    psql: "psql",
+    databaseUrl: "postgres://localhost/restore",
+    spawnImpl,
+    log: (line) => lines.push(line),
+  });
+  assert.deepEqual(totals, [{ extension: OTHER_EXTENSION, tables: 2, rows: 3 }]);
+  assert.match(lines.join(""), /"my app"\.notes \(1 rows in the dump\)/);
+  assert.match(lines.join(""), /my\."app notes" \(2 rows in the dump\)/);
+});
+
 test("the restored-table check asks in batches small enough for one psql argument, and keeps the order", async () => {
   // The longest names Postgres allows, every character a quote, so each doubles when quoted.
   const longest = `"${'""'.repeat(63)}"`;
@@ -319,6 +375,21 @@ test("the restored-table check asks in batches small enough for one psql argumen
   assert.equal(states[100], "empty");
   assert.equal(states[249], "missing");
   assert.equal(states.filter((state) => state === "rows").length, 248);
+});
+
+test("the restored-table check asks nothing for no names, and once for exactly one batch", async () => {
+  const queries = [];
+  const psql = fakePsql(queries, () => "");
+  const spawnImpl = (_command, args) => {
+    queries.push(args[args.indexOf("--command") + 1]);
+    return psql();
+  };
+  const options = { psql: "psql", databaseUrl: "postgres://localhost/restore", spawnImpl };
+  assert.deepEqual(await restoredTables([], options), []);
+  assert.equal(queries.length, 0);
+  const names = Array.from({ length: 100 }, (_, index) => `public.t${index}`);
+  assert.equal((await restoredTables(names, options)).length, 100);
+  assert.equal(queries.length, 1);
 });
 
 test("the restore check compares each count with the dump", async () => {
@@ -350,6 +421,83 @@ test("the restore check compares each count with the dump", async () => {
   await verifyAuthUsers({ ...options, spawnImpl: askedSpawn });
   assert.equal(asked.length, 3);
   for (const sql of asked) assert.ok(sql.includes(STORAGE_LOGIN_EMAIL), sql);
+});
+
+test("a dump without sign-in identities is not asked about them, and a mismatch names the database the caller checked", async () => {
+  const toc = "230; 1259 17500 TABLE auth users supabase_auth_admin\n4270; 0 17500 TABLE DATA auth users supabase_auth_admin\n";
+  const answers = { users: "3", withPassword: "2", identities: "0" };
+  const asked = [];
+  const spawnImpl = (command, args) => {
+    if (command === "pg_restore") return fakeSpawn({ users: USERS_COPY })(command, args);
+    const sql = args[args.indexOf("--command") + 1];
+    asked.push(sql);
+    const key = sql.includes("identities") ? "identities" : sql.includes("encrypted_password") ? "withPassword" : "users";
+    return fakePsql([], () => `${answers[key]}\n`)();
+  };
+  const options = { toc, dumpPath: "d", pgRestore: "pg_restore", psql: "psql", databaseUrl: "postgresql://x", spawnImpl };
+  assert.deepEqual(await verifyAuthUsers(options), { users: 3, withPassword: 2, identities: 0 });
+  assert.equal(asked.length, 2);
+  assert.equal(asked.some((sql) => sql.includes("auth.identities")), false);
+  answers.users = "2";
+  await assert.rejects(verifyAuthUsers({ ...options, label: "the new project" }), /the dump has 3 accounts, the new project has 2\./);
+});
+
+/** Executables standing in for pg_restore and psql: pg_restore prints `copy`, psql prints the answer for its query. */
+function restoreTools(dir, copy, psqlScript) {
+  writeFileSync(path.join(dir, "copy.txt"), copy);
+  writeFileSync(path.join(dir, "pg_restore"), `#!/bin/sh\ncat "${dir}/copy.txt"\n`);
+  writeFileSync(path.join(dir, "psql"), psqlScript);
+  for (const tool of ["pg_restore", "psql"]) chmodSync(path.join(dir, tool), 0o755);
+  return {
+    PATH: process.env.PATH,
+    LIFEBOAT_PG_RESTORE: path.join(dir, "pg_restore"),
+    LIFEBOAT_PSQL: path.join(dir, "psql"),
+    RESTORE_DATABASE_URL: "postgresql://postgres:throwaway@localhost:5432/restore",
+  };
+}
+
+test("skipped-count writes what the list loaded but the database lacks", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "lg-skipped-count-"));
+  const script = path.join(ROOT, "scripts", "restore-list.mjs");
+  const toc = path.join(dir, "restore.toc");
+  const skip = path.join(dir, "restore.skip.json");
+  const out = path.join(dir, "skipped.counts");
+  writeFileSync(toc, "4290; 0 17700 TABLE DATA audit pgaudit_log postgres\n");
+  writeFileSync(skip, JSON.stringify({ extensions: [], schemas: [], preexisting: [], installed: [], publications: [], eventTriggers: [] }));
+  const env = restoreTools(dir, "COPY audit.pgaudit_log (id) FROM stdin;\n1\n2\n\\.\n", '#!/bin/sh\necho "0 missing"\n');
+  try {
+    const run = spawnSync(process.execPath, [script, "skipped-count", toc, skip, path.join(dir, "d.backup"), out, toc], { encoding: "utf8", env });
+    assert.equal(run.status, 0, run.stderr);
+    assert.equal(readFileSync(out, "utf8"), `${OTHER_EXTENSION} 1 2\n`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("auth-verify writes the users it matched for run.sh, or none when the dump has no Supabase Auth", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "lg-auth-verify-"));
+  const script = path.join(ROOT, "scripts", "restore-list.mjs");
+  const toc = path.join(dir, "restore.toc");
+  const counts = path.join(dir, "auth.counts");
+  // Three accounts, two with a password; the dump has no auth.identities rows.
+  const env = {
+    ...restoreTools(dir, USERS_COPY, '#!/bin/sh\ncase "$*" in\n  *encrypted_password*) echo 2 ;;\n  *) echo 3 ;;\nesac\n'),
+    LIFEBOAT_AUTH_COUNTS_FILE: counts,
+  };
+  const verify = () => spawnSync(process.execPath, [script, "auth-verify", toc, path.join(dir, "d.backup")], { encoding: "utf8", env });
+  try {
+    writeFileSync(toc, "230; 1259 17500 TABLE auth users supabase_auth_admin\n4270; 0 17500 TABLE DATA auth users supabase_auth_admin\n");
+    const users = verify();
+    assert.equal(users.status, 0, users.stderr);
+    assert.equal(readFileSync(counts, "utf8"), "3 2 0\n");
+    writeFileSync(toc, "224; 1259 17467 TABLE public notes postgres\n");
+    const none = verify();
+    assert.equal(none.status, 0, none.stderr);
+    assert.match(none.stdout, /Users check skipped: the dump has no Supabase Auth users\./);
+    assert.equal(readFileSync(counts, "utf8"), "none\n");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 function fakeTools(dir, toc) {

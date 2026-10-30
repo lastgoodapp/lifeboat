@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -42,13 +43,13 @@ const PLAIN_SQL = `CREATE TABLE public.places (
  * Fakes for docker, psql, pg_restore and aws. The fake database offers PostGIS only after
  * docker starts a postgis/ image, and pg_restore fails the way FlipPro did when it does not.
  */
-function fakes(dir, { toc, sql, target, dockerRun, dumpKey, download, authCopy = {}, authRestored = {}, codeKey = "", codeArchive = "", setupKey = "", setupArchive = "", storageKeys = [], storageArchive = "", dumpRows = {}, missing = [] }) {
+function fakes(dir, { toc, sql, target, dockerRun, dumpKey, download, authCopy = {}, authRestored = {}, codeKey = "", codeArchive = "", setupKey = "", setupArchive = "", storageKeys = [], storageArchive = "", dumpRows = {}, missing = [], deadProbes = 0 }) {
   const bin = path.join(dir, "bin");
   mkdirSync(bin);
   writeFileSync(path.join(dir, "dump.toc"), toc);
   writeFileSync(path.join(dir, "dump.schema.sql"), sql);
   writeFileSync(path.join(dir, "target"), target);
-  for (const name of ["docker.log", "psql.log", "restore.log"]) writeFileSync(path.join(dir, name), "");
+  for (const name of ["docker.log", "psql.log", "restore.log", "aws.log"]) writeFileSync(path.join(dir, name), "");
   // Supabase Auth rows in the dump, as pg_restore -a prints them, and the counts the restored database answers.
   for (const [table, copy] of Object.entries(authCopy)) writeFileSync(path.join(dir, `copy.auth.${table}`), copy);
   for (const [key, count] of Object.entries(authRestored)) writeFileSync(path.join(dir, `restored.${key}`), `${count}\n`);
@@ -88,16 +89,24 @@ for arg in "$@"; do
 done
 case "$sql" in
   "SHOW server_version_num") echo 170006 ;;
-  "SELECT 1") echo 1 ;;
+  # The first deadProbes "SELECT 1" answers are refused, as from a database that has not started (or never does).
+  "SELECT 1")
+    probes=$(cat "${dir}/probes" 2>/dev/null || echo 0)
+    echo $((probes + 1)) > "${dir}/probes"
+    if [ "$probes" -lt ${deadProbes} ]; then
+      echo 'psql: error: connection to server at "localhost" (127.0.0.1), port 5432 failed: Connection refused' >&2
+      exit 2
+    fi
+    echo 1 ;;
   "SELECT name FROM pg_available_extensions")
     echo plpgsql
     if [ "$(cat "${dir}/target")" = postgis ]; then printf '%s\\n' postgis postgis_raster postgis_topology postgis_sfcgal; fi ;;
   "SELECT nspname FROM pg_namespace") printf '%s\\n' public pg_catalog ;;
   "SELECT extname FROM pg_extension") echo plpgsql ;;
   *pg_total_relation_size*) echo 8192 ;;
-  "SELECT count(*) FROM public.places") echo 2 ;;
-  "SELECT count(*) FROM auth.users") cat "${dir}/restored.users" ;;
-  "SELECT count(*) FROM auth.identities") cat "${dir}/restored.identities" ;;
+  'SELECT count(*) FROM "public"."places"') echo 2 ;;
+  "SELECT count(*) FROM auth.users"|'SELECT count(*) FROM "auth"."users"') cat "${dir}/restored.users" ;;
+  "SELECT count(*) FROM auth.identities"|'SELECT count(*) FROM "auth"."identities"') cat "${dir}/restored.identities" ;;
   # The users check leaves LastGood's storage login out, so its queries end with that condition.
   "SELECT count(*) FROM auth.users WHERE encrypted_password IS NOT NULL AND encrypted_password <> '' AND email IS DISTINCT FROM 'lastgood-backup@lastgood.invalid'") cat "${dir}/restored.withPassword" ;;
   "SELECT count(*) FROM auth.users WHERE email IS DISTINCT FROM 'lastgood-backup@lastgood.invalid'") cat "${dir}/restored.users" ;;
@@ -143,6 +152,7 @@ exit 0
 `,
     // The bucket holds the dump under db/ and, when a test gives them, a code copy under repo/ and a setup copy under setup/.
     aws: `#!/bin/sh
+printf '%s\\n' "$*" >> "${dir}/aws.log"
 case " $* " in
   *" s3api "*"/repo/ "*) ${codeKey ? `echo '{"Contents":[{"Key":"${codeKey}"}]}'` : `echo '{"Contents":[]}'`} ;;
   *" s3api "*"/setup/ "*) ${setupKey ? `echo '{"Contents":[{"Key":"${setupKey}"}]}'` : `echo '{"Contents":[]}'`} ;;
@@ -189,9 +199,10 @@ function runRestoreTest({
   storageArchive = "",
   dumpRows = {},
   missing = [],
+  deadProbes = 0,
 } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "lg-restore-test-"));
-  const bin = fakes(dir, { toc, sql, target, dockerRun, dumpKey, download, authCopy, authRestored, codeKey, codeArchive, setupKey, setupArchive, storageKeys, storageArchive, dumpRows, missing });
+  const bin = fakes(dir, { toc, sql, target, dockerRun, dumpKey, download, authCopy, authRestored, codeKey, codeArchive, setupKey, setupArchive, storageKeys, storageArchive, dumpRows, missing, deadProbes });
   const work = path.join(dir, "work");
   const runner = path.join(dir, "runner");
   mkdirSync(work);
@@ -218,7 +229,7 @@ function runRestoreTest({
     encoding: "utf8",
   });
   const read = (name) => readFileSync(path.join(dir, name), "utf8");
-  return { result, docker: read("docker.log"), psql: read("psql.log"), restores: read("restore.log"), work };
+  return { result, docker: read("docker.log"), psql: read("psql.log"), restores: read("restore.log"), aws: read("aws.log"), work };
 }
 
 const CONTAINER = {
@@ -272,6 +283,23 @@ test("a PostGIS image that does not start fails the restore test and names PostG
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /The dump uses PostGIS, and the PostGIS image postgis\/postgis:17-3\.5 did not start/);
   assert.equal(restores, "");
+});
+
+test("a throwaway database that never answers fails the restore test before anything is downloaded", () => {
+  // The workflow's Start the restore database step goes on when it fails, so Lifeboat runs and reports it instead of
+  // the month's test restore never checking in.
+  const { result, restores, aws, psql } = runRestoreTest({ toc: PLAIN_TOC, sql: PLAIN_SQL, deadProbes: 99 });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /The throwaway database for the test restore did not answer, so nothing was restored\. The workflow's Start the restore database step says why\./);
+  assert.equal(aws, "");
+  assert.equal(restores, "");
+  assert.equal(psql.trim().split("\n").length, 2);
+});
+
+test("a throwaway database that answers on its second try is restored as usual", () => {
+  const { result, restores } = runRestoreTest({ toc: PLAIN_TOC, sql: PLAIN_SQL, deadProbes: 1 });
+  assert.equal(result.status, 0, result.stderr);
+  assert.notEqual(restores, "");
 });
 
 test("a dump without PostGIS keeps the stock image and its extension warnings", () => {
@@ -425,11 +453,11 @@ test("with encryption on, a plain copy someone else put in the bucket is not res
   const { result, restores } = runRestoreTest({
     toc: PLAIN_TOC,
     sql: PLAIN_SQL,
-    dumpKey: "lifeboat/db/20991231T000000Z.backup",
+    dumpKey: "lifeboat/db/20261019T000000Z.backup",
     env: { LIFEBOAT_ENCRYPT: "true", LIFEBOAT_PRIVATE_KEY: privateKey },
   });
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /20991231T000000Z\.backup, is not encrypted/);
+  assert.match(result.stderr, /20261019T000000Z\.backup, is not encrypted/);
   assert.match(result.stderr, /It was not restored/);
   assert.equal(restores, "");
 });
@@ -813,6 +841,183 @@ test("the test restore opens the newest files copy: every entry lists and a samp
   for (const left of ["storage-restore", "storage-restore.tar", "storage.download"]) {
     assert.equal(existsSync(path.join(work, left)), false, `${left} is not left on the runner`);
   }
+});
+
+/** A LastGood stand-in in its own process, so run.sh, run synchronously here, can check in with it. Keeps each body. */
+async function checkinCatcher() {
+  const file = path.join(mkdtempSync(path.join(tmpdir(), "lg-restore-checkin-")), "checkins.jsonl");
+  const child = spawn(process.execPath, [
+    "-e",
+    `const { createServer } = require("node:http");
+const { appendFileSync } = require("node:fs");
+const server = createServer((request, response) => {
+  let body = "";
+  request.on("data", (chunk) => (body += chunk));
+  request.on("end", () => {
+    appendFileSync(${JSON.stringify(file)}, body + "\\n");
+    response.writeHead(202, { "content-type": "application/json" }).end("{}");
+  });
+});
+server.listen(0, "127.0.0.1", () => console.log(server.address().port));`,
+  ]);
+  const port = await new Promise((resolve) => child.stdout.once("data", (chunk) => resolve(Number(String(chunk).trim()))));
+  return {
+    env: { CHECKIN_SECRET: "unit-test-checkin-secret", CHECKIN_URL: `http://127.0.0.1:${port}/api/checkin`, LIFEBOAT_PROJECT: "abcdefghijklmnopqrst" },
+    bodies: () => (existsSync(file) ? readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line)) : []),
+    stop: () => child.kill(),
+  };
+}
+
+/** A copy's name for a time this many hours ago, as the workflow names one: 20261029T161700Z. */
+function stampHoursAgo(hours) {
+  return new Date(Date.now() - hours * 60 * 60 * 1000).toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+}
+
+test("the test restore says how long ago the database copy it opens was made, and warns from 48 hours", () => {
+  const warning = /::warning::The newest database copy/;
+  for (const [hours, age] of [[0.5, "less than an hour"], [1.5, "1 hour"], [47.5, "47 hours"]]) {
+    const stamp = stampHoursAgo(hours);
+    const { result } = runRestoreTest({ toc: PLAIN_TOC, sql: PLAIN_SQL, dumpKey: `lifeboat/db/${stamp}.backup` });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, new RegExp(`Test restore: opening the newest database copy, ${stamp}\\.backup, made ${age} ago\\.`));
+    assert.doesNotMatch(result.stderr, warning, String(hours));
+  }
+  for (const [hours, age] of [[48.5, "2 days"], [26 * 24 + 3, "26 days"]]) {
+    const stamp = stampHoursAgo(hours);
+    const { result } = runRestoreTest({ toc: PLAIN_TOC, sql: PLAIN_SQL, dumpKey: `lifeboat/db/${stamp}.backup` });
+    // An old copy that restores still passes: the test checked that night, and the warning says which.
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(
+      result.stderr.includes(
+        `::warning::The newest database copy, ${stamp}.backup, was made ${age} ago. Backups run every night, so the ones since then left no newer copy. This test restore checks that night's copy, not the data as it is now. Look at the backup runs in this repository's Actions tab.`,
+      ),
+      result.stderr,
+    );
+  }
+  const { result } = runRestoreTest({ toc: PLAIN_TOC, sql: PLAIN_SQL, dumpKey: "lifeboat/db/handmade.backup" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Test restore: opening the database copy handmade\.backup\. Its name has no time, so its night is not known\./);
+  assert.doesNotMatch(result.stderr, warning);
+});
+
+test("the test restore checks in with the time of the copy it opened, pass or fail, and the time never names it", async () => {
+  const catcher = await checkinCatcher();
+  try {
+    const stamp = stampHoursAgo(26 * 24);
+    const passed = runRestoreTest({ toc: PLAIN_TOC, sql: PLAIN_SQL, dumpKey: `lifeboat/db/${stamp}.backup`, env: catcher.env });
+    assert.equal(passed.result.status, 0, passed.result.stderr);
+    // With encryption on, the same plain copy is refused, and the failed test still says which night it tried.
+    const refused = runRestoreTest({ toc: PLAIN_TOC, sql: PLAIN_SQL, dumpKey: `lifeboat/db/${stamp}.backup`, env: { ...catcher.env, LIFEBOAT_ENCRYPT: "true" } });
+    assert.notEqual(refused.result.status, 0);
+    const handmade = runRestoreTest({ toc: PLAIN_TOC, sql: PLAIN_SQL, dumpKey: "lifeboat/db/handmade.backup", env: catcher.env });
+    assert.equal(handmade.result.status, 0, handmade.result.stderr);
+    const [pass, fail, unnamed] = catcher.bodies();
+    const at = `${stamp.slice(0, 4)}-${stamp.slice(4, 6)}-${stamp.slice(6, 8)}T${stamp.slice(9, 11)}:${stamp.slice(11, 13)}:${stamp.slice(13, 15)}Z`;
+    assert.deepEqual([pass.kind, pass.ok, pass.restoredCopyAt], ["restore-test", true, at]);
+    assert.deepEqual([fail.ok, fail.restoredCopyAt], [false, at]);
+    assert.equal(unnamed.restoredCopyAt, null);
+    // The failure's own error text names the copy, as it always has, and so does the list of copies opened; the time
+    // field never does.
+    assert.doesNotMatch(JSON.stringify([pass.restoredCopyAt, unnamed.restoredCopyAt]), /\.backup|handmade/);
+  } finally {
+    catcher.stop();
+  }
+});
+
+test("the test restore checks in with each copy it downloaded and the SHA-256 of the bytes it downloaded, pass or fail", async () => {
+  const catcher = await checkinCatcher();
+  const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+  try {
+    const archive = codeCopy();
+    const dumpKey = "lifeboat/db/20261017T000000Z.backup";
+    const passed = runRestoreTest({ toc: PLAIN_TOC, sql: PLAIN_SQL, dumpKey, codeKey: CODE_KEY, codeArchive: archive, env: catcher.env });
+    assert.equal(passed.result.status, 0, passed.result.stderr);
+    // A plain copy refused under encryption was still downloaded, so the failed test names it too.
+    const refused = runRestoreTest({ toc: PLAIN_TOC, sql: PLAIN_SQL, dumpKey, env: { ...catcher.env, LIFEBOAT_ENCRYPT: "true" } });
+    assert.notEqual(refused.result.status, 0);
+    const [pass, fail] = catcher.bodies();
+    // The fake bucket serves the dump as the bytes "dump" and the code copy as the archive the test made.
+    assert.deepEqual(pass.opened, [
+      { key: dumpKey, sha256: sha256("dump") },
+      { key: CODE_KEY, sha256: sha256(readFileSync(archive)) },
+    ]);
+    assert.deepEqual(fail.opened, [{ key: dumpKey, sha256: sha256("dump") }]);
+  } finally {
+    catcher.stop();
+  }
+});
+
+test("a copy named for a time still to come is never the newest, so it can't stand in for every month's test restore", () => {
+  const { privateKey, publicKey, copy } = ageCopy();
+  const later = "lifeboat/storage/29991231T000000Z.tar.age";
+  const { result } = runRestoreTest({
+    toc: PLAIN_TOC,
+    sql: PLAIN_SQL,
+    dumpKey: AGE_KEY,
+    download: copy,
+    storageKeys: [FILES_KEY, later, "lifeboat/storage/29990101T000000Z.tar.age"],
+    storageArchive: filesCopy({ publicKey }),
+    env: { LIFEBOAT_ENCRYPT: "true", LIFEBOAT_PRIVATE_KEY: privateKey },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /listed out of 20261018T000000Z\.tar\.age,/);
+  assert.match(
+    result.stderr,
+    /::warning::Left out 2 copies under lifeboat\/storage\/ named for a time still to come, such as 29990101T000000Z\.tar\.age\. This workflow never names a copy that way, so the test restore used the newest copy named for a time that has passed\./,
+  );
+
+  // A copy a few minutes ahead, as a runner's clock can be, is still taken.
+  const soon = new Date(Date.now() + 5 * 60 * 1000).toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+  const close = runRestoreTest({
+    toc: PLAIN_TOC,
+    sql: PLAIN_SQL,
+    dumpKey: AGE_KEY,
+    download: copy,
+    storageKeys: [FILES_KEY, `lifeboat/storage/${soon}.tar.age`],
+    storageArchive: filesCopy({ publicKey }),
+    env: { LIFEBOAT_ENCRYPT: "true", LIFEBOAT_PRIVATE_KEY: privateKey },
+  });
+  assert.equal(close.result.status, 0, close.result.stderr);
+  assert.match(close.result.stdout, new RegExp(`listed out of ${soon}\\.tar\\.age,`));
+  assert.doesNotMatch(close.result.stderr, /Left out/);
+});
+
+test("a copy whose name has no time is passed over while a dated one is there, and used with a warning when none is", () => {
+  const { privateKey, publicKey, copy } = ageCopy();
+  // Kept by hand beside the nightly copies, it sorts after every dated name, so it would stand in for every month's test.
+  const kept = "lifeboat/storage/keep-before-launch.tar.age";
+  const both = runRestoreTest({
+    toc: PLAIN_TOC,
+    sql: PLAIN_SQL,
+    dumpKey: AGE_KEY,
+    download: copy,
+    storageKeys: [FILES_KEY, kept],
+    storageArchive: filesCopy({ publicKey }),
+    env: { LIFEBOAT_ENCRYPT: "true", LIFEBOAT_PRIVATE_KEY: privateKey },
+  });
+  assert.equal(both.result.status, 0, both.result.stderr);
+  assert.match(both.result.stdout, /listed out of 20261018T000000Z\.tar\.age,/);
+  assert.match(
+    both.result.stderr,
+    /::warning::Left out 1 copy under lifeboat\/storage\/ whose name has no time, such as keep-before-launch\.tar\.age\. This workflow names every copy for the time it was made, so the test restore used the newest copy named that way\./,
+  );
+
+  const alone = runRestoreTest({
+    toc: PLAIN_TOC,
+    sql: PLAIN_SQL,
+    dumpKey: AGE_KEY,
+    download: copy,
+    storageKeys: [kept],
+    storageArchive: filesCopy({ publicKey }),
+    env: { LIFEBOAT_ENCRYPT: "true", LIFEBOAT_PRIVATE_KEY: privateKey },
+  });
+  assert.equal(alone.result.status, 0, alone.result.stderr);
+  assert.match(alone.result.stdout, /listed out of keep-before-launch\.tar\.age,/);
+  assert.match(
+    alone.result.stderr,
+    /::warning::No copy under lifeboat\/storage\/ is named for the time it was made, so the test restore used keep-before-launch\.tar\.age, the last by name\. This workflow names every copy for its time, so that copy was put there some other way\./,
+  );
+  assert.doesNotMatch(alone.result.stderr, /Left out/);
 });
 
 test("a files copy holding a link is not extracted, so the check can never follow it outside the folder", () => {

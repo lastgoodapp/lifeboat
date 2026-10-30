@@ -21,6 +21,16 @@ const AT_ONCE = 4;
 const ATTEMPTS = 3;
 const MAX_WAIT_MS = 60_000;
 const PAGE = 1000;
+/** A call with nothing large to carry gets a minute to answer. */
+export const CALL_TIMEOUT_MS = 60_000;
+
+/**
+ * How long a call may take: a minute, plus a second for every 64 KiB it sends or reads, so a slow line (about 0.5
+ * Mbit/s) still gets a 6 MB part through, and a connection that stalls stops the call instead of the whole rebuild.
+ */
+export function timeLimit(bytes = 0) {
+  return CALL_TIMEOUT_MS + Math.ceil(bytes / 65_536) * 1000;
+}
 /** Supabase recommends a resumable upload above 6 MB, and takes its parts in exactly this size. */
 export const CHUNK = 6 * 1024 * 1024;
 /** The storage.objects columns that say who owns a file, set back after the upload. */
@@ -190,19 +200,25 @@ function objectPath(bucket, name) {
   return `${encodeURIComponent(bucket)}/${name.split("/").map(encodeURIComponent).join("/")}`;
 }
 
-/** Storage API calls with the secret key: retried on a network error, 429 or 5xx; a refused key stops the step. */
-function storageClient({ base, key, fetchImpl, sleep }) {
+/** Storage API calls with the secret key: retried on a network error, no answer within the time limit, 429 or 5xx; a refused key stops the step. */
+function storageClient({ base, key, fetchImpl, sleep, limit = timeLimit }) {
   const host = new URL(base).host;
   const hide = (refusal) => ({ ...refusal, message: refusal.message.split(key).join("…") });
 
-  async function call(url, init, what) {
+  /** `bytes` is how much the call sends, or reads back, which sets its time limit. */
+  async function call(url, init, what, bytes = 0) {
     let last = null;
     for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
       let response;
+      const ms = limit(bytes);
       try {
-        response = await fetchImpl(url, { ...init, headers: { apikey: key, Authorization: `Bearer ${key}`, "User-Agent": "lastgood-cli", ...(init.headers ?? {}) } });
-      } catch {
-        last = { status: 0, message: `${host} could not be reached` };
+        response = await fetchImpl(url, {
+          ...init,
+          headers: { apikey: key, Authorization: `Bearer ${key}`, "User-Agent": "lastgood-cli", ...(init.headers ?? {}) },
+          signal: AbortSignal.timeout(ms),
+        });
+      } catch (error) {
+        last = { status: 0, message: error?.name === "TimeoutError" ? `nothing came back within ${Math.round(ms / 1000)} seconds` : `${host} could not be reached` };
         if (attempt < ATTEMPTS) await sleep(1000 * 2 ** (attempt - 1));
         continue;
       }
@@ -218,11 +234,29 @@ function storageClient({ base, key, fetchImpl, sleep }) {
     return { refusal: last };
   }
 
+  /**
+   * A call's whole answer. One cut off, or stalled past its time limit, after it began is asked for again, waiting 1 s
+   * then 2 s, as a call that never answered is.
+   */
+  async function body(url, init, what, bytes, read) {
+    for (let attempt = 1; ; attempt += 1) {
+      const { response, refusal } = await call(url, init, what, bytes);
+      if (refusal) return { refusal };
+      try {
+        return { answer: await read(response) };
+      } catch {
+        if (attempt >= ATTEMPTS) return { cut: true };
+        await sleep(1000 * 2 ** (attempt - 1));
+      }
+    }
+  }
+
   async function json(url, init, what) {
-    const { response, refusal } = await call(url, init, what);
+    const { answer, refusal, cut } = await body(url, init, what, 0, (response) => response.text());
     if (refusal) throw new StepError(`${host} did not answer when ${what}: ${refusal.message}.`);
+    if (cut) throw new StepError(`${host}'s answer was cut off when ${what}.`);
     try {
-      return await response.json();
+      return JSON.parse(answer);
     } catch {
       throw new StepError(`${host} sent something other than JSON when ${what}.`);
     }
@@ -264,17 +298,24 @@ function storageClient({ base, key, fetchImpl, sleep }) {
       }
       return found;
     },
-    async read(bucket, name) {
-      const { response, refusal } = await call(`${base}/storage/v1/object/authenticated/${objectPath(bucket, name)}`, { headers: { Accept: "*/*" } }, `reading a file back from ${bucket}`);
+    async read(bucket, name, size) {
+      const { answer, refusal, cut } = await body(
+        `${base}/storage/v1/object/authenticated/${objectPath(bucket, name)}`,
+        { headers: { Accept: "*/*" } },
+        `reading a file back from ${bucket}`,
+        size,
+        async (response) => Buffer.from(await response.arrayBuffer()),
+      );
       if (refusal) throw new StepError(`${host} would not give back a file from ${bucket}: ${refusal.message}.`);
-      return Buffer.from(await response.arrayBuffer());
+      if (cut) throw new StepError(`The file read back from ${bucket} was cut off.`);
+      return answer;
     },
     /** One file up, never over an existing one. Null when it went in, else the refusal. */
     async upload(bucket, entry, meta) {
       if (entry.size <= CHUNK) {
         const headers = { "Content-Type": meta.type, "x-upsert": "false" };
         if (meta.cache) headers["cache-control"] = meta.cache;
-        const { refusal } = await call(`${base}/storage/v1/object/${objectPath(bucket, entry.name)}`, { method: "POST", headers, body: await readFile(entry.file) }, `uploading a file to ${bucket}`);
+        const { refusal } = await call(`${base}/storage/v1/object/${objectPath(bucket, entry.name)}`, { method: "POST", headers, body: await readFile(entry.file) }, `uploading a file to ${bucket}`, entry.size);
         return refusal ?? null;
       }
       return resumable(bucket, entry, meta);
@@ -313,6 +354,7 @@ function storageClient({ base, key, fetchImpl, sleep }) {
           url,
           { method: "PATCH", headers: { "Tus-Resumable": "1.0.0", "Upload-Offset": String(offset), "Content-Type": "application/offset+octet-stream" }, body: part },
           `uploading part of a file to ${bucket}`,
+          length,
         );
         if (sent.refusal) {
           // 409 here means Supabase already has more of the file than this part assumed: ask how much, and go on from there.
@@ -405,28 +447,51 @@ export async function restoreOwners({ target, block, uploaded, work, psql = "psq
  * Uploads every file in an opened files copy into a new Supabase project's buckets, checks every one is there at the
  * size it was saved and reads one back, then sets each file's owner as it was.
  */
-export async function rebuildFiles({ archive, dumpPath, databaseTo, filesTo, key, work, say, todo = say, fetchImpl = fetch, sleep = defaultSleep, pgRestore = "pg_restore", psql = "psql" }) {
+export async function rebuildFiles({ archive, dumpPath, databaseTo, filesTo, key, work, say, todo = say, fetchImpl = fetch, sleep = defaultSleep, pgRestore = "pg_restore", psql = "psql", limit = timeLimit }) {
   const secret = checkSecretKey(key);
   const target = connection(databaseTo);
   const base = storageBase(filesTo, databaseTo);
-  const storage = storageClient({ base, key: secret, fetchImpl, sleep });
+  const storage = storageClient({ base, key: secret, fetchImpl, sleep, limit });
   const host = storage.host;
 
   const dir = path.join(work, "files");
   await rm(dir, { recursive: true, force: true });
-  await checkArchive(archive, "files");
+  const { files: inCopy } = await checkArchive(archive, "files");
   await mkdir(dir, { recursive: true });
   const extract = await run("tar", ["-xf", archive, "-C", dir, "--no-same-owner"]);
   if (extract.code !== 0) throw new StepError("The files copy did not open.");
   const copy = await filesIn(dir);
   const all = [...copy].flatMap(([bucket, files]) => files.map((entry) => ({ bucket, entry })));
+  // A disk that does not tell names apart by capitals or accents (a Mac's, unless set up otherwise) keeps one file where
+  // the copy has two: one name would go up with the other's bytes and the other would be lost, so nothing goes up.
+  if (all.length !== inCopy.length) {
+    const seen = new Map();
+    const same = [];
+    for (const name of inCopy) {
+      const folded = name.normalize("NFC").toLowerCase();
+      if (seen.has(folded)) same.push([seen.get(folded), name].sort().join(" and "));
+      else seen.set(folded, name);
+    }
+    throw new StepError(
+      `The files copy holds ${counted(inCopy.length, "file")}, but ${counted(all.length, "file")} came out on this computer's disk${same.length > 0 ? `, which takes names that differ only in capitals or accents as one (${listed(same)})` : ""}. Nothing was uploaded.`,
+      "Set TMPDIR to a folder on a case-sensitive disk (on a Mac, a case-sensitive APFS volume made in Disk Utility), then run this again.",
+    );
+  }
   const bytes = all.reduce((total, { entry }) => total + entry.size, 0);
   const holds = `${counted(all.length, "file")} (${counted(bytes, "byte")}) in ${counted(copy.size, "bucket")}`;
   say(`The copy holds ${holds}.`);
   if (all.length === 0) return "no files in the copy";
 
   const dumped = await run(pgRestore, ["--data-only", "--schema", "storage", "--table", "objects", "--file", "-", dumpPath]);
-  const block = dumped.code === 0 ? copyBlock(dumped.stdout, "storage.objects") : null;
+  // A copy pg_restore cannot read (often one from a newer PostgreSQL) stops here, before any upload: files sent up
+  // without their types would be kept as they are by every later run.
+  if (dumped.code !== 0) {
+    throw new StepError(
+      `pg_restore could not read the database copy, so no file was uploaded: ${clean(dumped.stderr || "pg_restore failed.")}`,
+      "Each file's type and owner come from the database copy. A copy made by a newer PostgreSQL needs pg_restore from that version or later: install the PostgreSQL client tools, version 17 or newer, then run this again.",
+    );
+  }
+  const block = copyBlock(dumped.stdout, "storage.objects");
   const records = new Map();
   for (const line of block?.lines ?? []) {
     const row = copyRow(block.columns, line);
@@ -495,7 +560,7 @@ export async function rebuildFiles({ archive, dumpPath, databaseTo, filesTo, key
     if (failed.length > 0) parts.push(`${counted(failed.length, "file")} Supabase did not take (${listed(failed)})`);
     throw new StepError(
       `Not every file went in: ${parts.join("; ")}.`,
-      "Raise the new project's upload size limit (Storage settings) or the bucket's limits where needed, then run this again with --skip database. Files already uploaded are kept and not sent again.",
+      "Raise the new project's upload size limit (Storage settings) or the bucket's limits where needed, then run this again. Files already uploaded are kept and not sent again.",
     );
   }
 
@@ -508,7 +573,7 @@ export async function rebuildFiles({ archive, dumpPath, databaseTo, filesTo, key
   say(`${host} holds every file in the copy at the size it was saved: ${holds}.`);
   const sample = all.filter(({ entry }) => entry.size > 0).sort((left, right) => left.entry.size - right.entry.size)[0];
   if (sample) {
-    const back = await storage.read(sample.bucket, sample.entry.name);
+    const back = await storage.read(sample.bucket, sample.entry.name, sample.entry.size);
     const local = await readFile(sample.entry.file);
     if (sha256(back) !== sha256(local)) throw new StepError(`A file read back from ${sample.bucket} does not match the copy.`);
     say(`A sample file of ${counted(sample.entry.size, "byte")} read back the same as the copy.`);

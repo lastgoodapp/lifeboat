@@ -148,7 +148,16 @@ async function call(url, { token, fetchImpl, sleep, what, permission, accept = "
       if (attempt < ATTEMPTS) await sleep(1000 * 2 ** (attempt - 1));
       continue;
     }
-    if (response.ok) return response;
+    if (response.ok) {
+      // The body can still be cut off, or stall past the timeout, after the status arrives: try again as above.
+      try {
+        return { contentType: response.headers.get("content-type") ?? "", bytes: Buffer.from(await response.arrayBuffer()) };
+      } catch {
+        last = `Supabase's answer was cut off when reading ${what}.`;
+        if (attempt < ATTEMPTS) await sleep(1000 * 2 ** (attempt - 1));
+        continue;
+      }
+    }
     last = explain(response.status, what, permission);
     if (response.status < 500 && response.status !== 429) break;
     if (attempt < ATTEMPTS) await sleep(waitFor(response, attempt));
@@ -156,9 +165,9 @@ async function call(url, { token, fetchImpl, sleep, what, permission, accept = "
   throw new SetupError(last ?? `Supabase did not answer when reading ${what}.`);
 }
 
-async function json(response, what) {
+async function json(answer, what) {
   try {
-    return await response.json();
+    return JSON.parse(new TextDecoder().decode(answer.bytes));
   } catch {
     throw new SetupError(`Supabase sent something other than JSON for ${what}.`);
   }
@@ -241,9 +250,7 @@ async function copyFunction(base, fn, dir, deps) {
   const slug = fn?.slug;
   if (typeof slug !== "string" || !SLUG.test(slug)) throw new SetupError("Supabase listed an Edge Function with a name this copy cannot use as a folder.");
   const what = `the source of the ${slug} function`;
-  const response = await call(`${base}/functions/${slug}/body`, { ...deps, what, permission: "Edge Functions", accept: "multipart/form-data" });
-  const contentType = response.headers.get("content-type") ?? "";
-  const bytes = Buffer.from(await response.arrayBuffer());
+  const { contentType, bytes } = await call(`${base}/functions/${slug}/body`, { ...deps, what, permission: "Edge Functions", accept: "multipart/form-data" });
   if (bytes.length === 0) throw new SetupError(`Supabase sent an empty body for ${what}.`);
   const fnDir = path.join(dir, "functions", slug);
   mkdirSync(fnDir, { recursive: true });
@@ -289,14 +296,14 @@ async function copyFunction(base, fn, dir, deps) {
 }
 
 async function readOnlyQuery(base, sql, what, deps) {
-  const response = await call(`${base}/database/query/read-only`, {
+  const answer = await call(`${base}/database/query/read-only`, {
     ...deps,
     what,
     permission: "Database",
     method: "POST",
     body: JSON.stringify({ query: sql }),
   });
-  const rows = await json(response, what);
+  const rows = await json(answer, what);
   if (!Array.isArray(rows)) throw new SetupError(`Supabase sent something other than rows for ${what}.`);
   return rows;
 }

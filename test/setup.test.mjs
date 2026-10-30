@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -327,6 +327,54 @@ test("a rate limit waits as long as Supabase asks, then carries on", async () =>
   assert.deepEqual(waits, [7000]);
 });
 
+test("a rate limit that never lifts is named as one, and any other error by its status", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "lg-setup-"));
+  const always = (status) => ({ override: { [`GET /v1/projects/${REF}/config/auth`]: { json: { message: "busy" }, status } } });
+  await assert.rejects(
+    exportSetup({ api: API, ref: REF, token: TOKEN, dir, fetchImpl: fakeFetch(answers(always(429))), sleep: noSleep }),
+    /Supabase's rate limit stopped the copy of .*\. The next run tries again\./,
+  );
+  await assert.rejects(exportSetup({ api: API, ref: REF, token: TOKEN, dir, fetchImpl: fakeFetch(answers(always(502))), sleep: noSleep }), /Supabase answered 502 when reading /);
+});
+
+test("only a request with a body says it is JSON", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "lg-setup-"));
+  const sent = [];
+  const answer = fakeFetch(answers());
+  const fetchImpl = (url, init = {}) => {
+    sent.push({ method: init.method ?? "GET", type: init.headers?.["Content-Type"] ?? null });
+    return answer(url, init);
+  };
+  await exportSetup({ api: API, ref: REF, token: TOKEN, dir, fetchImpl, sleep: noSleep });
+  assert.ok(sent.some((request) => request.method === "POST"));
+  for (const request of sent) assert.equal(request.type, request.method === "POST" ? "application/json" : null, request.method);
+});
+
+test("a file name in a charset other than UTF-8 stops the copy, even one that would read the same", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "lg-setup-"));
+  const latin = multipart([{ headers: { "Content-Disposition": "form-data; name=\"file\"; filename*=ISO-8859-1''notes.ts" }, body: "x" }]);
+  const override = { [`GET /v1/projects/${REF}/functions/hello/body`]: { body: latin, type: `multipart/form-data; boundary=${BOUNDARY}` } };
+  await assert.rejects(exportSetup({ api: API, ref: REF, token: TOKEN, dir, fetchImpl: fakeFetch(answers({ override })), sleep: noSleep }), /Supabase sent a file name this copy cannot read\./);
+});
+
+test("a function's entrypoint and details come from Supabase's metadata part, and a bundle keeps the listed entrypoint", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "lg-setup-"));
+  const details = { entrypoint_path: "file:///src/hello/index.ts", static_patterns: ["assets/*"] };
+  const body = multipart([
+    { headers: { "Content-Disposition": 'form-data; name="metadata"' }, body: JSON.stringify(details) },
+    { headers: { "Content-Disposition": 'form-data; name="file"; filename="hello/index.ts"' }, body: "Deno.serve(() => new Response('hi'));\n" },
+  ]);
+  const override = {
+    [`GET /v1/projects/${REF}/functions`]: { json: [{ ...FUNCTIONS[0], entrypoint_path: "file:///src/hello/old.ts" }, { ...FUNCTIONS[1], entrypoint_path: "file:///src/bundle/index.ts" }] },
+    [`GET /v1/projects/${REF}/functions/hello/body`]: { body, type: `multipart/form-data; boundary=${BOUNDARY}` },
+  };
+  await exportSetup({ api: API, ref: REF, token: TOKEN, dir, fetchImpl: fakeFetch(answers({ override })), sleep: noSleep });
+  const hello = JSON.parse(readFileSync(path.join(dir, "functions", "hello", "source.json"), "utf8"));
+  assert.equal(hello.entrypoint_path, "file:///src/hello/index.ts", "the metadata's entrypoint, not the list's older one");
+  assert.deepEqual(hello.metadata, details);
+  assert.equal(JSON.parse(readFileSync(path.join(dir, "functions", "old-bundle", "source.json"), "utf8")).entrypoint_path, "file:///src/bundle/index.ts");
+});
+
 test("a token that is not scoped still copies, with a warning to replace it", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "lg-setup-"));
   const notes = [];
@@ -582,4 +630,56 @@ test("a Supabase call that never answers is given up after two minutes and tried
   assert.equal(stuck.calls(), 3);
   assert.deepEqual(stuck.limits(), [CALL_TIMEOUT_MS, CALL_TIMEOUT_MS, CALL_TIMEOUT_MS]);
   assert.equal(CALL_TIMEOUT_MS, 120_000);
+});
+
+test("a part of a function's source with no Content-Disposition is passed over, not a failed copy", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "lg-setup-"));
+  const body = multipart([
+    { headers: { "Content-Type": "text/plain" }, body: "a part with no name" },
+    { headers: { "Content-Disposition": 'form-data; name="file"; filename="hello/index.ts"' }, body: "Deno.serve(() => new Response('hi'));\n" },
+  ]);
+  const override = { [`GET /v1/projects/${REF}/functions/hello/body`]: { body, type: `multipart/form-data; boundary=${BOUNDARY}` } };
+  const counts = await exportSetup({ api: API, ref: REF, token: TOKEN, dir, fetchImpl: fakeFetch(answers({ override })), sleep: noSleep });
+  assert.equal(counts.functions, 2);
+  const source = JSON.parse(readFileSync(path.join(dir, "functions", "hello", "source.json"), "utf8"));
+  assert.deepEqual(source.files.map((file) => file.saved), ["files/hello/index.ts"]);
+});
+
+test("without a sleep given, a busy answer waits a second on the clock before Supabase is asked again", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const dir = mkdtempSync(path.join(tmpdir(), "lg-setup-"));
+  let tries = 0;
+  const override = {
+    [`GET /v1/projects/${REF}/functions`]: () => (++tries < 2 ? { json: { message: "busy" }, status: 503 } : { json: [] }),
+  };
+  const settle = async () => {
+    for (let round = 0; round < 10; round += 1) await new Promise((resolve) => setImmediate(resolve));
+  };
+  const copy = exportSetup({ api: API, ref: REF, token: TOKEN, dir, fetchImpl: fakeFetch(answers({ override })) });
+  await settle();
+  assert.equal(tries, 1);
+  t.mock.timers.tick(999);
+  await settle();
+  assert.equal(tries, 1, "not asked again before the second is up");
+  t.mock.timers.tick(1);
+  assert.deepEqual(await copy, { functions: 0, cronJobs: 2, databaseWebhooks: 1, vaultSecretNames: 1 });
+  assert.equal(tries, 2);
+});
+
+test("supabase-setup.mjs --check reads a folder back and prints its counts, and an unexpected failure prints no detail", async () => {
+  const script = path.join(ROOT, "scripts", "supabase-setup.mjs");
+  const dir = mkdtempSync(path.join(tmpdir(), "lg-setup-check-"));
+  await exportSetup({ api: API, ref: REF, token: TOKEN, dir, fetchImpl: fakeFetch(answers()), sleep: noSleep });
+  assert.equal(execFileSync(process.execPath, [script, "--check", dir], { encoding: "utf8", env: { PATH: process.env.PATH } }), "2 2 1 1\n");
+
+  // A folder that cannot be made, under a file, is not a SetupError: the run's log gets the plain line, not Node's.
+  const file = path.join(mkdtempSync(path.join(tmpdir(), "lg-setup-")), "not-a-folder");
+  writeFileSync(file, "");
+  const failed = spawnSync(process.execPath, [script, path.join(file, "setup")], {
+    encoding: "utf8",
+    env: { PATH: process.env.PATH, SUPABASE_PROJECT_REF: REF, LIFEBOAT_SUPABASE_TOKEN: TOKEN, SUPABASE_API_URL: "http://127.0.0.1:9" },
+  });
+  assert.equal(failed.status, 1);
+  assert.equal(failed.stderr, "The Supabase setup copy failed.\n");
+  assert.equal(failed.stdout, "");
 });

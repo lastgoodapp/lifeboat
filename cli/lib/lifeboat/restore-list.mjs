@@ -4,10 +4,11 @@
  * A missing extension is a warning. A data error fails the restore test.
  * PostGIS is not Supabase-only: a dump that needs it gets a target that offers it, or the test stops.
  */
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 
 /** PostGIS extensions. A target that lacks one the dump needs is an error, not a warning. */
 export const POSTGIS_EXTENSIONS = ["postgis", "postgis_raster", "postgis_topology", "postgis_sfcgal"];
@@ -700,8 +701,15 @@ function runClassify(errPath, skipPath, statusText) {
   for (const warning of result.warnings) {
     process.stdout.write(`Restore warning: ${sanitiseRestoreLine(warning)}\n`);
   }
-  if (result.fatal.length > 0 || (status !== 0 && result.warnings.length === 0)) {
-    const message = result.fatal[0] ? sanitiseRestoreLine(result.fatal[0]) : "pg_restore failed.";
+  // Stopped by a signal (137 is the out-of-memory killer's), pg_restore prints no error of its own, and the warnings
+  // before it would otherwise pass a restore that never made its indexes, constraints, policies or triggers.
+  const killed = status > 128 && status < 160;
+  if (killed || result.fatal.length > 0 || (status !== 0 && result.warnings.length === 0)) {
+    const message = killed
+      ? `pg_restore was stopped by signal ${status - 128} before it finished.`
+      : result.fatal[0]
+        ? sanitiseRestoreLine(result.fatal[0])
+        : "pg_restore failed.";
     const postgis = result.fatal.some(isPostgisTypeError) ? "the restore database does not have PostGIS. " : "";
     process.stderr.write(`Restore failed: ${postgis}${message}\n`);
     process.exitCode = 1;
@@ -733,8 +741,9 @@ function commandOutput(command, args, spawnImpl) {
     const child = run(command, args, { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
+    const decode = utf8Chunks();
     child.stdout?.on("data", (chunk) => {
-      stdout += String(chunk);
+      stdout += decode(chunk);
     });
     child.stderr?.on("data", (chunk) => {
       stderr += String(chunk);
@@ -760,7 +769,8 @@ export async function verifySampleCounts(options) {
     );
     const size = Number(String(sizeText).trim());
     if (!Number.isFinite(size) || size < 0 || size > SAMPLE_BYTES) continue;
-    const countSql = `SELECT count(*) FROM ${table.schema}.${table.table}`;
+    // Quoted, so a table named "User" is counted rather than read as public.user. simpleIdent allows no quote marks.
+    const countSql = `SELECT count(*) FROM "${table.schema}"."${table.table}"`;
     const restoredText = await commandOutput(
       options.psql,
       [options.databaseUrl, "--no-psqlrc", "--tuples-only", "--no-align", "--command", countSql],
@@ -872,14 +882,21 @@ export function authTablesInToc(toc) {
   };
 }
 
+/** Decodes a child's output chunk by chunk, so a character split across two chunks comes out whole. */
+function utf8Chunks() {
+  const decoder = new StringDecoder("utf8");
+  return (chunk) => (typeof chunk === "string" ? chunk : decoder.write(chunk));
+}
+
 function streamLines(command, args, onLine, spawnImpl) {
   const run = spawnImpl ?? spawn;
   return new Promise((resolve, reject) => {
     const child = run(command, args, { stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
     let rest = "";
+    const decode = utf8Chunks();
     child.stdout?.on("data", (chunk) => {
-      const text = rest + String(chunk);
+      const text = rest + decode(chunk);
       const lines = text.split("\n");
       rest = lines.pop() ?? "";
       for (const line of lines) onLine(line);
@@ -950,6 +967,92 @@ export function storageShortfall(dumped, copied) {
   if (missing <= 0) return { state: "ok", missing: 0 };
   if (copied === 0 || missing >= Math.max(5, Math.ceil(dumped * 0.05))) return { state: "hidden", missing };
   return { state: "note", missing };
+}
+
+/** One field of a COPY text row, with its backslash escapes undone. Null for \\N. */
+export function decodeCopyField(field) {
+  if (field === undefined || field === "\\N") return null;
+  const escapes = { b: "\b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v" };
+  return field.replace(/\\(?:([0-7]{1,3})|x([0-9a-fA-F]{1,2})|(.))/g, (_, octal, hex, char) => {
+    if (octal) return String.fromCharCode(parseInt(octal, 8));
+    if (hex) return String.fromCharCode(parseInt(hex, 16));
+    return escapes[char] ?? char;
+  });
+}
+
+/**
+ * The files storage.objects listed when the dump ran, each as "bucket/name" (a bucket's name never holds a slash).
+ * Null when the dump has no such rows.
+ */
+export async function storageObjectNames(options) {
+  const entries = String(options.toc).split("\n").map(parseTocLine).filter(Boolean);
+  if (!entries.some((entry) => entry.desc === "TABLE DATA" && entry.namespace === "storage" && entry.tag === "objects")) return null;
+  const names = new Set();
+  let columns = null;
+  let done = false;
+  await streamLines(
+    options.pgRestore,
+    ["-a", "-n", "storage", "-t", "objects", "-f", "-", options.dumpPath],
+    (line) => {
+      if (done) return;
+      if (!columns) {
+        if (line.startsWith("COPY ")) columns = copyColumns(line);
+        return;
+      }
+      if (line === "\\.") {
+        done = true;
+        return;
+      }
+      const values = line.split("\t");
+      const bucket = decodeCopyField(values[columns.indexOf("bucket_id")]);
+      const name = decodeCopyField(values[columns.indexOf("name")]);
+      if (bucket !== null && name !== null) names.add(`${bucket}/${name}`);
+    },
+    options.spawnImpl,
+  );
+  if (!columns || !columns.includes("bucket_id") || !columns.includes("name")) {
+    throw new Error("pg_restore did not return the storage.objects rows with their bucket and name.");
+  }
+  return names;
+}
+
+/** The files a storage copy saved under `root`, as "bucket/name": one folder per bucket, the file's name as its path. */
+export function copiedStorageNames(root) {
+  const names = new Set();
+  const walk = (dir, prefix) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isDirectory()) walk(path.join(dir, entry.name), `${prefix}${entry.name}/`);
+      else if (entry.isFile()) names.add(`${prefix}${entry.name}`);
+    }
+  };
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    if (entry.isDirectory()) walk(path.join(root, entry.name), `${entry.name}/`);
+  }
+  return names;
+}
+
+/**
+ * One read-only query that asks the live database which of these files ("bucket/name") are still in storage.objects,
+ * with how many and in which buckets. A file the dump listed, that is still there after the copy, yet is not in the
+ * copy, was hidden from the storage login rather than deleted in between. The names travel as one dollar-quoted JSON
+ * value, so no name is ever read as SQL.
+ */
+export function stillThereSql(keys) {
+  const rows = [...keys].map((key) => {
+    const at = key.indexOf("/");
+    return { b: key.slice(0, at), n: key.slice(at + 1) };
+  });
+  const json = JSON.stringify(rows);
+  let tag = "lastgood";
+  while (json.includes(`$${tag}$`)) tag += "_";
+  return [
+    "START TRANSACTION READ ONLY;",
+    "SET LOCAL statement_timeout = '60s';",
+    "SELECT count(*) || ' ' || coalesce(string_agg(DISTINCT o.bucket_id, ', ' ORDER BY o.bucket_id), '')",
+    `FROM storage.objects o JOIN json_to_recordset($${tag}$${json}$${tag}$::json) AS m(b text, n text) ON o.bucket_id = m.b AND o.name = m.n;`,
+    "COMMIT;",
+    "",
+  ].join("\n");
 }
 
 /** After a test restore: the same counts must come back out of the throwaway database. */
@@ -1238,16 +1341,35 @@ async function runAuthCount(tocPath, dumpPath) {
   process.stdout.write(counts ? `${counts.users} ${counts.withPassword} ${counts.identities}\n` : "none\n");
 }
 
-async function runStorageCheck(tocPath, dumpPath, copiedText) {
+/**
+ * "none", or "<state> <missing> <dumped>". Given the copy's folder and a file to write to, a copy that is not already
+ * plainly short is held to the dump's names too: when any file the dump lists is not in the copy, the state is "ask",
+ * <missing> counts those files, and the file gets the query that asks the live database which are still there.
+ */
+async function runStorageCheck(tocPath, dumpPath, copiedText, root, sqlPath) {
   const copied = Number(copiedText);
   if (!Number.isInteger(copied) || copied < 0) throw new Error("storage-check needs the number of files copied.");
-  const dumped = await storageObjectCount({ toc: readFileSync(tocPath, "utf8"), dumpPath, pgRestore: process.env.LIFEBOAT_PG_RESTORE || "pg_restore" });
+  const options = { toc: readFileSync(tocPath, "utf8"), dumpPath, pgRestore: process.env.LIFEBOAT_PG_RESTORE || "pg_restore" };
+  // With the copy to compare, one pass over the rows gives their names and so their count.
+  const listed = root && sqlPath ? await storageObjectNames(options) : null;
+  const dumped = listed ? listed.size : await storageObjectCount(options);
   if (dumped === null) {
     process.stdout.write("none\n");
     return;
   }
   const { state, missing } = storageShortfall(dumped, copied);
-  process.stdout.write(`${state} ${missing} ${dumped}\n`);
+  if (state === "hidden" || !listed) {
+    process.stdout.write(`${state} ${missing} ${dumped}\n`);
+    return;
+  }
+  const have = copiedStorageNames(root);
+  const gone = [...listed].filter((key) => !have.has(key));
+  if (gone.length === 0) {
+    process.stdout.write(`ok 0 ${dumped}\n`);
+    return;
+  }
+  writeFileSync(sqlPath, stillThereSql(gone), { mode: 0o600 });
+  process.stdout.write(`ask ${gone.length} ${dumped}\n`);
 }
 
 async function runAuthVerify(tocPath, dumpPath) {
@@ -1290,8 +1412,8 @@ async function main() {
     await runAuthCount(args[0], args[1]);
     return;
   }
-  if (command === "storage-check" && args.length === 3) {
-    await runStorageCheck(args[0], args[1], args[2]);
+  if (command === "storage-check" && (args.length === 3 || args.length === 5)) {
+    await runStorageCheck(args[0], args[1], args[2], args[3], args[4]);
     return;
   }
   if (command === "auth-verify" && args.length === 2) {

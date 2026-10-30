@@ -16,6 +16,10 @@ const body = JSON.stringify({
   kind,
   project: (process.env.LIFEBOAT_PROJECT || "").slice(0, 80),
   startedAt: process.env.LIFEBOAT_STARTED_AT || null,
+  // The GitHub Actions run this check-in came from, and which attempt, as GitHub numbers them, so LastGood can ask GitHub
+  // about this one run rather than any run in the repository (K9). Null outside Actions.
+  runId: runNumberEnv("GITHUB_RUN_ID"),
+  runAttempt: runNumberEnv("GITHUB_RUN_ATTEMPT"),
   finishedAt: new Date().toISOString(),
   dumpBytes: numberEnv("LIFEBOAT_DUMP_BYTES"),
   storageObjects: numberEnv("LIFEBOAT_STORAGE_OBJECTS"),
@@ -55,6 +59,12 @@ const body = JSON.stringify({
   // What a test restore left out with an extension the throwaway database does not offer, such as Vault's secrets on
   // stock Postgres, so a pass does not read as a full restore. Extension names and counts only, never a table's rows.
   notChecked: kind === "restore-test" ? notChecked(process.env.LIFEBOAT_RESTORE_NOT_CHECKED) : [],
+  // Which night's database copy a test restore opened, so a pass on an old copy does not read as a pass on today's
+  // data. The time from the copy's name only, never the name. Null in a backup, or when the name has no time.
+  restoredCopyAt: kind === "restore-test" ? copyTime(process.env.LIFEBOAT_RESTORE_COPY) : null,
+  // Each copy a test restore downloaded, with the SHA-256 of the bytes it downloaded, so LastGood can check them against
+  // the records it kept when a backup uploaded them (D18). A backup sends an empty list.
+  opened: kind === "restore-test" ? openedFile(process.env.LIFEBOAT_OPENED_FILE) : [],
   error: process.env.LIFEBOAT_ERROR ? process.env.LIFEBOAT_ERROR.slice(0, 300) : null,
 });
 
@@ -78,6 +88,25 @@ function optionalNumberEnv(name) {
   if (raw === "") return null;
   const value = Number(raw);
   return Number.isFinite(value) ? value : null;
+}
+
+/** A run ID or attempt as GitHub sets it: a whole number from 1, or null when it is missing or not one. */
+function runNumberEnv(name) {
+  const raw = (process.env[name] ?? "").trim();
+  if (!/^[1-9]\d{0,15}$/.test(raw)) return null;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
+/** The time a copy's name starts with, such as 20261029T161700Z, as 2026-10-29T16:17:00Z. Null when it has none. */
+function copyTime(name) {
+  const match = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z/.exec(String(name ?? ""));
+  if (!match) return null;
+  const [, year, month, day, hour, minute, second] = match;
+  const iso = `${year}-${month}-${day}T${hour}:${minute}:${second}Z`;
+  // A name such as 20261340T... is not a time, and Date would roll it into another one.
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) && new Date(ms).toISOString() === iso.replace("Z", ".000Z") ? iso : null;
 }
 
 /** run.sh's "extension tables rows" entries, separated by semicolons. */
@@ -108,6 +137,22 @@ function copiesFile(file) {
     });
 }
 
+/** The copies run.sh downloaded, one per line: key and SHA-256. At most four, one per part a test restore opens. */
+function openedFile(file) {
+  let text = "";
+  try {
+    text = file ? readFileSync(file, "utf8") : "";
+  } catch {
+    return [];
+  }
+  return text
+    .split("\n")
+    .map((line) => line.split("\t"))
+    .filter(([key, sha256]) => key && key.length <= 300 && /^[0-9a-f]{64}$/.test(sha256 ?? ""))
+    .slice(0, 4)
+    .map(([key, sha256]) => ({ key, sha256 }));
+}
+
 /**
  * What a run that worked should say when only its check-in failed, so a red run in the middle of a LastGood outage
  * doesn't read as a failed backup. Without the check-in LastGood has no checksum record of tonight's copies (D18).
@@ -121,7 +166,8 @@ function afterFailedCheckin(runKind) {
 /**
  * Posts the check-in, trying twice more when LastGood or the network fails on its side (no answer, 408, 429 or 5xx),
  * so a blip doesn't turn a good backup red or leave its copies unrecorded (D18). A refusal (401, 400) is final. Each
- * try is signed afresh, since the signature carries its time. Under two minutes at most, waits included.
+ * try is signed afresh, since the signature carries its time. Under two minutes at most, waits included. Exits 2
+ * when the last try still did not get through, and 1 on a refusal, which the next run would meet again.
  */
 async function sendWithRetries() {
   const waitMs = Number(process.env.LIFEBOAT_CHECKIN_WAIT_MS ?? "") || 5000;
@@ -147,11 +193,12 @@ async function sendWithRetries() {
     } catch (error) {
       problem = error?.name === "TimeoutError" ? "(no answer within 30 seconds)." : "(LastGood could not be reached).";
     }
-    const again = attempt < waits.length && (!response || response.status === 408 || response.status === 429 || response.status >= 500);
-    if (!again) {
+    const notThrough = !response || response.status === 408 || response.status === 429 || response.status >= 500;
+    if (!notThrough || attempt >= waits.length) {
       console.error(`Check-in failed ${problem}`.trim());
       if (ok) console.error(afterFailedCheckin(kind));
-      process.exit(1);
+      // 2 when it never got through, so run.sh can take back what only a recorded check-in makes good; 1 when refused.
+      process.exit(notThrough ? 2 : 1);
     }
     console.log(`Check-in failed ${problem.trim()} Trying again in ${Math.round(waits[attempt] / 1000)} s.`);
     await new Promise((resolve) => setTimeout(resolve, waits[attempt]));

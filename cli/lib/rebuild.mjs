@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process";
+import { isDeepStrictEqual } from "node:util";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { removeIfStopped } from "./cleanup.mjs";
 import { countMetadata } from "./lifeboat/github-metadata.mjs";
 import { countCopyRows, STORAGE_LOGIN_EMAIL, verifyAuthUsers, verifySampleCounts } from "./lifeboat/restore-list.mjs";
 import { restoreCopy, RestoreError } from "./restore.mjs";
@@ -24,6 +26,30 @@ export class StepError extends Error {
   }
 }
 
+/** An API call with nothing large to carry gets a minute to answer. */
+export const CALL_TIMEOUT_MS = 60_000;
+
+/**
+ * How long one API call may take: a minute, plus a second for every 64 KiB it sends, so a slow line (about 0.5 Mbit/s)
+ * still gets a large function bundle through, and a connection that stalls stops the call instead of the rebuild.
+ */
+export function timeLimit(bytes = 0) {
+  return CALL_TIMEOUT_MS + Math.ceil(bytes / 65_536) * 1000;
+}
+
+/** Why a call got no answer: the network, or no answer within its time limit. */
+export function noAnswer(error, ms, service) {
+  return error?.name === "TimeoutError" ? `nothing came back within ${Math.round(ms / 1000)} seconds` : `${service} could not be reached`;
+}
+
+/** Whether `now` holds everything `sent` set, part by part: a settings read back that may carry more than was sent. */
+export function holds(now, sent) {
+  if (sent && typeof sent === "object" && !Array.isArray(sent)) {
+    return Boolean(now) && typeof now === "object" && Object.entries(sent).every(([key, value]) => holds(now[key], value));
+  }
+  return isDeepStrictEqual(now, sent);
+}
+
 /** Runs a program and gathers what it printed. Never throws on a non-zero exit: the caller reads `code`. */
 export function run(command, args, options = {}) {
   return new Promise((resolve) => {
@@ -34,11 +60,14 @@ export function run(command, args, options = {}) {
     });
     let stdout = "";
     let stderr = "";
+    // Read as UTF-8 across chunks, so a character the pipe splits in two (a file name in Japanese) arrives whole.
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
-      stdout += String(chunk);
+      stdout += chunk;
     });
     child.stderr.on("data", (chunk) => {
-      stderr += String(chunk);
+      stderr += chunk;
     });
     child.on("error", (error) => resolve({ code: 127, stdout, stderr: error.code === "ENOENT" ? `${command} is not installed.` : String(error) }));
     child.on("close", (code) => resolve({ code: code ?? 1, stdout, stderr }));
@@ -55,7 +84,9 @@ export function duration(ms) {
 /**
  * Runs the steps in order, timing each, and prints a summary. A failed step stops the ones after it, which are listed
  * as not run, so the customer knows exactly what is done. A step with `skip` set is one the customer said an earlier
- * run finished; it is listed as skipped with that reason. Returns true when every step that ran finished.
+ * run finished; it is listed as skipped with that reason. A step with `again` set refuses to run twice: when it
+ * finished and a later step failed, the summary says how to run the rest again without it. Returns true when every
+ * step that ran finished.
  *
  * Each step gets `say` for its progress and `todo` for what the customer must still do by hand: a todo line is printed
  * where it happens and again in one numbered list after the summary, with `options.always` (what rebuild never does)
@@ -104,6 +135,9 @@ export async function runSteps(steps, write = (text) => process.stdout.write(tex
   write(`  Total ${duration(total)}.\n`);
   const failure = results.find((result) => result.status === "failed");
   if (failure?.hint) write(`\n${failure.hint}\n`);
+  // A step that refuses to run twice, such as the database, says how to leave it out of the next run once it is done.
+  const again = failure ? steps.filter((step, index) => step.again && results[index].status === "done" && index < results.indexOf(failure)).map((step) => step.again) : [];
+  if (again.length > 0) write(`\nWhen you run it again, ${again.join(", and ")}.\n`);
   const list = todoList(results, options.always ?? []);
   if (list.length > 0) {
     write("\nStill to do by hand\n");
@@ -206,6 +240,16 @@ function refLines(text) {
     .filter((line) => line && !line.endsWith("^{}"));
 }
 
+/** Each branch and tag with the object it points at, from "<object> <ref>" lines as for-each-ref and ls-remote print them. */
+function refObjects(text) {
+  const refs = new Map();
+  for (const line of refLines(text)) {
+    const [object, name] = line.split(/\s+/);
+    if (/^refs\/(heads|tags)\//.test(name ?? "")) refs.set(name, object);
+  }
+  return refs;
+}
+
 /** A name in an archive that would land outside the folder it is opened into: an absolute path, or one with a ".." part. */
 export function outsideName(name) {
   return name.startsWith("/") || name.split("/").includes("..");
@@ -227,6 +271,9 @@ export async function checkArchive(archive, what, { gzip = false } = {}) {
   if (outside.length > 0) {
     throw new StepError(`The ${what} copy names a path outside its own folder (${clean(outside[0])}), which a LastGood backup never writes. It was not used.`);
   }
+  // Both listings are in the archive's order, so a line of one is the same entry as that line of the other.
+  const lines = listing.stdout.split("\n");
+  return { files: names.stdout.split("\n").filter((name, index) => name && lines[index]?.startsWith("-")).map((name) => name.replace(/^\.\//, "")) };
 }
 
 /** Pushes every branch and tag in an opened code copy to an empty repository. */
@@ -291,16 +338,22 @@ export async function rebuildCode({ archive, to, work, say, todo = say, fetchImp
 
   const remote = await git(["ls-remote", "--", to], { interactive: true });
   if (remote.code !== 0) throw new StepError(`git could not reach ${shown}: ${clean(remote.stderr)}`, "Check the address, and that this computer can push to it with your own git login.");
+  let there = false;
   if (refLines(remote.stdout).length > 0) {
-    throw new StepError(`${shown} is not empty, so nothing was pushed. Rebuild pushes only into a new, empty repository, so it never writes over code.`);
+    // A rerun after a later step failed finds its own push: every branch and tag at the copy's commits, and no others.
+    const copied = refObjects((await git(["-C", mirror, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads", "refs/tags"])).stdout);
+    there = isDeepStrictEqual(refObjects(remote.stdout), copied);
+    if (!there) throw new StepError(`${shown} is not empty, so nothing was pushed. Rebuild pushes only into a new, empty repository, so it never writes over code.`);
+    say(`${shown} already holds the copy's ${refs} at the same commits, from an earlier run, so nothing was pushed.`);
+  } else {
+    const push = await git(["-C", mirror, "push", "--quiet", "--", to, "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*"], { interactive: true });
+    if (push.code !== 0) throw new StepError(`git could not push to ${shown}: ${clean(push.stderr)}`);
+    const after = refLines((await git(["ls-remote", "--heads", "--tags", "--", to], { interactive: true })).stdout);
+    if (after.length !== heads.length + tags.length) {
+      throw new StepError(`${shown} has ${after.length} branches and tags after the push, not the ${heads.length + tags.length} in the copy.`);
+    }
+    say(`Pushed ${refs} to ${shown}.`);
   }
-  const push = await git(["-C", mirror, "push", "--quiet", "--", to, "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*"], { interactive: true });
-  if (push.code !== 0) throw new StepError(`git could not push to ${shown}: ${clean(push.stderr)}`);
-  const after = refLines((await git(["ls-remote", "--heads", "--tags", "--", to], { interactive: true })).stdout);
-  if (after.length !== heads.length + tags.length) {
-    throw new StepError(`${shown} has ${after.length} branches and tags after the push, not the ${heads.length + tags.length} in the copy.`);
-  }
-  say(`Pushed ${refs} to ${shown}.`);
   const oldDefault = typeof repository?.default_branch === "string" ? repository.default_branch : head.replace(/^refs\/heads\//, "");
   if (oldDefault) todo(`The old default branch was ${oldDefault}. If GitHub shows another, set it under Settings, then Branches.`);
   if (metadata) {
@@ -308,7 +361,7 @@ export async function rebuildCode({ archive, to, work, say, todo = say, fetchImp
       `Issues and pull requests are not recreated: the copy holds ${counted(metadata.issues, "issue")}, ${counted(metadata.pullRequests, "pull request")} and ${counted(metadata.comments, "comment")} as JSON, in its github folder (open it with lastgood restore).`,
     );
   }
-  return `${refs} pushed`;
+  return `${refs} ${there ? "already there" : "pushed"}`;
 }
 
 /**
@@ -325,9 +378,16 @@ export function connection(url) {
   if (!/^postgres(ql)?:$/.test(parsed.protocol)) {
     throw new StepError("The database address is not a postgresql:// connection string. Copy it from the new project's Connect button in Supabase.");
   }
-  const password = decodeURIComponent(parsed.password);
+  let password;
+  try {
+    password = decodeURIComponent(parsed.password);
+  } catch {
+    // A password pasted in as it is, with a % that is not an escape. The message never repeats it.
+    throw new StepError("The password in the database address has a % the address cannot carry as it is. Write each % in the password as %25, then run this again.");
+  }
   parsed.password = "";
-  const env = { ...process.env };
+  // pg_restore and psql colour their messages when PG_COLOR is always, even into a pipe, and then no error is read.
+  const env = { ...process.env, PG_COLOR: "never" };
   if (password) env.PGPASSWORD = password;
   return { url: parsed.toString(), env, shown: `${parsed.hostname}${parsed.pathname}` };
 }
@@ -578,20 +638,29 @@ const SUPABASE_ROW_NOTES = {
   "supabase_migrations.schema_migrations": "the Supabase CLI's migration history. If you use migrations, mark them applied with supabase migration repair.",
 };
 
-/** A private folder for opened copies, removed when `task` finishes, whatever happens. */
+/** A private folder for opened copies, removed when `task` finishes, whatever happens, or when the command is stopped (Ctrl-C). */
 export async function withWorkFolder(task) {
-  const work = await mkdtemp(path.join(tmpdir(), "lastgood-rebuild-"));
+  let work;
+  try {
+    work = await mkdtemp(path.join(tmpdir(), "lastgood-rebuild-"));
+  } catch (error) {
+    throw new StepError(
+      `A private folder for the opened copies could not be made in ${tmpdir()} (${error?.code ?? "error"}). Set TMPDIR to a folder that exists, on a disk with room for the copies, then run this again.`,
+    );
+  }
+  const done = removeIfStopped(work);
   try {
     return await task(work);
   } finally {
     await rm(work, { recursive: true, force: true });
+    done();
   }
 }
 
-/** Opens a copy into the work folder, checked against its recorded SHA-256 unless the customer said not to. */
-export async function openCopy({ copy, key, sha256, unchecked, work, name, say }) {
+/** Opens a copy into the work folder, checked against its recorded SHA-256 (given with `flag`) unless the customer said not to. */
+export async function openCopy({ copy, key, sha256, unchecked, work, name, say, flag }) {
   const out = path.join(work, name);
-  const result = await restoreCopy({ copy, key, sha256: sha256 ?? null, unchecked, out });
+  const result = await restoreCopy({ copy, key, sha256: sha256 ?? null, unchecked, out, flag });
   say(result.checked ? `${path.basename(copy)} matches the SHA-256 your backup recorded, and opened.` : `${path.basename(copy)} opened without a check. Its SHA-256 is ${result.sha256}.`);
   return out;
 }

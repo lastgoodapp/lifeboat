@@ -6,16 +6,31 @@
 // Usage: node storage-copy.mjs <dir>. Prints "<buckets> <files> <bytes>" on success.
 import { createWriteStream, mkdirSync, statSync } from "node:fs";
 import path from "node:path";
-import { Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { pathToFileURL } from "node:url";
 
 const ATTEMPTS = 3;
+/**
+ * How long a sign-in or a list may take, its body included. Without it a call Supabase never answers waits as long as
+ * the job may run, on the repository's Actions minutes; with it the call is tried again like a dropped connection.
+ */
+export const CALL_TIMEOUT_MS = 60_000;
+/**
+ * How long a download may go without a byte arriving. A large file can take longer than CALL_TIMEOUT_MS to arrive
+ * whole, so a download is timed by the gaps in it instead, and a stall is tried again like a download cut off.
+ */
+export const IDLE_TIMEOUT_MS = 60_000;
 const MAX_WAIT_MS = 60_000;
 /** Refresh this long before the session runs out, so no request goes out with a token about to expire. */
 const REFRESH_EARLY_MS = 120_000;
 const PAGE = 1000;
 const DOWNLOADS_AT_ONCE = 4;
+/**
+ * The longest file or folder name a Linux disk holds, in bytes. Storage takes names up to 1024 characters, and a
+ * character outside ASCII takes two to four bytes, so a name Storage keeps can be one the runner cannot save.
+ */
+const NAME_BYTES = 255;
 export const REF = /^[a-z]{20}$/;
 
 export class StorageCopyError extends Error {}
@@ -73,6 +88,7 @@ export async function copyStorage({
   sleep = defaultSleep,
   now = Date.now,
   pageSize = PAGE,
+  idleMs = IDLE_TIMEOUT_MS,
 }) {
   if (!REF.test(ref ?? "")) throw new StorageCopyError("Set supabase-project-ref to the project's 20-letter ref, so the workflow knows whose files to copy.");
   if (!apikey) throw new StorageCopyError("Set LIFEBOAT_SUPABASE_PUBLISHABLE_KEY to the project's publishable key, so the storage login can sign in.");
@@ -81,7 +97,8 @@ export async function copyStorage({
   const base = (api || `https://${ref}.supabase.co`).replace(/\/+$/, "");
   const session = { access: "", refresh: "", expiresAt: 0 };
 
-  async function call(url, init, what, { auth = true } = {}) {
+  /** `signal` makes the signal for each try; by default a try gives up after CALL_TIMEOUT_MS. */
+  async function call(url, init, what, { auth = true, signal = () => AbortSignal.timeout(CALL_TIMEOUT_MS) } = {}) {
     let last = null;
     let renewed = false;
     for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
@@ -91,7 +108,7 @@ export async function copyStorage({
       if (auth) headers.Authorization = `Bearer ${used}`;
       let response;
       try {
-        response = await fetchImpl(url, { ...init, headers });
+        response = await fetchImpl(url, { ...init, headers, signal: signal() });
       } catch {
         last = `Supabase could not be reached when reading ${what}.`;
         if (attempt < ATTEMPTS) await sleep(1000 * 2 ** (attempt - 1));
@@ -173,17 +190,29 @@ export async function copyStorage({
     if (status === 403) {
       return `Supabase refused to let the storage login read ${what}. Connect again in LastGood to set its policies again. A storage policy that needs two-factor sign-in (aal2) can also cause this.`;
     }
-    if (status === 404) return `Supabase found no ${what}. It may have been deleted during the copy; the next run tries again.`;
+    if (status === 404) return `Supabase could not find ${what}. It may have been deleted during the copy; the next run tries again.`;
     if (status === 429) return `Supabase's rate limit stopped the copy of ${what}. The next run tries again.`;
     return `Supabase answered ${status} when reading ${what}.`;
   }
 
   async function json(url, init, what) {
-    const response = await call(url, init, what);
-    try {
-      return await response.json();
-    } catch {
-      throw new StorageCopyError(`Supabase sent something other than JSON for ${what}.`);
+    for (let attempt = 1; ; attempt += 1) {
+      const response = await call(url, init, what);
+      // The body can still be cut off after the status arrives: ask again, as a download is. A body that arrives whole
+      // but isn't JSON would come back the same, so that one stops here.
+      let text;
+      try {
+        text = await response.text();
+      } catch {
+        if (attempt >= ATTEMPTS) throw new StorageCopyError(`Supabase's answer was cut off when reading ${what}.`);
+        await sleep(1000 * 2 ** (attempt - 1));
+        continue;
+      }
+      try {
+        return JSON.parse(text);
+      } catch {
+        throw new StorageCopyError(`Supabase sent something other than JSON for ${what}.`);
+      }
     }
   }
 
@@ -236,6 +265,10 @@ export async function copyStorage({
         for (const entry of page) {
           const name = typeof entry?.name === "string" ? entry.name : "";
           if (!safeSegment(name)) throw new StorageCopyError(`Supabase listed a file in ${bucket} whose name cannot be saved safely.`);
+          // Saved, it would fail as if the download were cut off, three times over.
+          if (Buffer.byteLength(name) > NAME_BYTES) {
+            throw new StorageCopyError(`A file or folder in ${bucket} has a name too long to save on the runner (over ${NAME_BYTES} bytes). Shorten it in Supabase Storage so the files copy can include it.`);
+          }
           // A folder has no id; a file always has one.
           if (entry.id === null || entry.id === undefined) folders.push(`${prefix}${name}/`);
           else names.push(`${prefix}${name}`);
@@ -250,22 +283,75 @@ export async function copyStorage({
     const file = path.join(bucketDir, ...name.split("/"));
     // safeSegment already refuses "..", so this only guards against a change to it.
     if (!file.startsWith(`${bucketDir}${path.sep}`)) throw new StorageCopyError(`A file in ${bucket} would be saved outside its folder.`);
-    mkdirSync(path.dirname(file), { recursive: true });
+    try {
+      mkdirSync(path.dirname(file), { recursive: true });
+    } catch (error) {
+      throw savingFailed(error, bucket) ?? error;
+    }
     const url = `${base}/storage/v1/object/authenticated/${encodeURIComponent(bucket)}/${name.split("/").map(encodeURIComponent).join("/")}`;
     let last = null;
     for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
-      const response = await call(url, { headers: { Accept: "*/*" } }, `a file in ${bucket}`);
+      const idle = idleSignal(idleMs);
       try {
-        const body = response.body ?? Readable.toWeb(Readable.from([]));
-        await pipeline(Readable.fromWeb(body), createWriteStream(file, { mode: 0o600 }));
-        return statSync(file).size;
-      } catch {
-        last = `The download of a file in ${bucket} was cut off.`;
-        if (attempt < ATTEMPTS) await sleep(1000 * 2 ** (attempt - 1));
+        const response = await call(url, { headers: { Accept: "*/*" } }, `a file in ${bucket}`, { signal: idle.signal });
+        try {
+          const body = response.body ?? Readable.toWeb(Readable.from([]));
+          const watched = new Transform({
+            transform(chunk, _encoding, done) {
+              idle.touch();
+              done(null, chunk);
+            },
+          });
+          await pipeline(Readable.fromWeb(body), watched, createWriteStream(file, { mode: 0o600 }));
+          return statSync(file).size;
+        } catch (error) {
+          const saving = savingFailed(error, bucket);
+          if (saving) throw saving;
+          last = `The download of a file in ${bucket} was cut off.`;
+          if (attempt < ATTEMPTS) await sleep(1000 * 2 ** (attempt - 1));
+        }
+      } finally {
+        idle.stop();
       }
     }
     throw new StorageCopyError(last ?? `A file in ${bucket} could not be downloaded.`);
   }
+}
+
+/**
+ * The runner's disk refusing a file, which is not a download cut off: trying again would fail the same way, and the
+ * customer would look at the network. Null for anything else.
+ */
+function savingFailed(error, bucket) {
+  if (error?.code === "ENOSPC" || error?.code === "EDQUOT") return new StorageCopyError(`The runner ran out of disk while copying the files in ${bucket}.`);
+  if (typeof error?.code === "string" && ["open", "write", "close", "mkdir"].includes(error?.syscall)) {
+    return new StorageCopyError(`A file in ${bucket} could not be saved on the runner (${error.code}).`);
+  }
+  return null;
+}
+
+/**
+ * A signal for each try that gives up after `ms` with nothing arriving: `signal()` starts a new one, `touch()` restarts
+ * its clock when a piece of the file arrives, and `stop()` ends it.
+ */
+function idleSignal(ms) {
+  let controller = null;
+  let timer = null;
+  const arm = () => {
+    clearTimeout(timer);
+    const current = controller;
+    timer = setTimeout(() => current.abort(new DOMException(`Nothing arrived for ${ms} ms.`, "TimeoutError")), ms);
+    timer.unref?.();
+  };
+  return {
+    signal() {
+      controller = new AbortController();
+      arm();
+      return controller.signal;
+    },
+    touch: arm,
+    stop: () => clearTimeout(timer),
+  };
 }
 
 /** One path segment that is safe as a file or folder name: not empty, not "." or "..", no slash or NUL. */
