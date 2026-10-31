@@ -152,12 +152,18 @@ CODE_BYTES=""
 GITHUB_ISSUES=""
 GITHUB_PULLS=""
 GITHUB_COMMENTS=""
+# Empty until the code copy is up, then true or false: whether its default branch keeps files in Git LFS (B3).
+CODE_LFS=""
+# Empty until the code copy is up, then how many submodules its default branch points at (B3). Stays empty when git
+# could not read that branch.
+CODE_SUBMODULES=""
 AUTH_USERS=""
 AUTH_PASSWORDS=""
 AUTH_IDENTITIES=""
 SETUP_FUNCTIONS=""
 SETUP_CRON_JOBS=""
 SETUP_BYTES=""
+SETUP_SOURCE=""
 VERCEL_SOURCE=""
 VERCEL_ENV_VARS=""
 VERCEL_ENV_VALUES=""
@@ -166,6 +172,9 @@ VERCEL_DNS_RECORDS=""
 VERCEL_DNS_UNREADABLE=""
 RESTORE_NOT_CHECKED=""
 RESTORE_COPY=""
+# What a backup's monthly copy came to (B14): off, made, already or none, and why for none. Empty in a restore test.
+MONTHLY_STATE=""
+MONTHLY_REASON=""
 PART_ERRORS=""
 LIFEBOAT_ERROR=""
 LIFEBOAT_OK=false
@@ -302,6 +311,8 @@ report() {
     exit "$status"
   fi
   REPORTING=1
+  # Once the check-in starts, no signal stops it (see stopped below).
+  trap '' HUP INT TERM
   if [[ -n "${IDENTITY_FILE:-}" ]]; then
     rm -f "$IDENTITY_FILE"
   fi
@@ -310,6 +321,9 @@ report() {
   elif [[ -z "$LIFEBOAT_ERROR" ]]; then
     LIFEBOAT_ERROR="Lifeboat failed with status ${status}"
   fi
+  # node starts every signal back at its default, so it runs in a process group of its own, out of reach of a signal
+  # sent to this worker's.
+  set -m
   LIFEBOAT_OK="$LIFEBOAT_OK" \
     LIFEBOAT_KIND="$MODE" \
     LIFEBOAT_STARTED_AT="$STARTED_AT" \
@@ -320,6 +334,8 @@ report() {
     LIFEBOAT_CODE_BRANCHES="$CODE_BRANCHES" \
     LIFEBOAT_CODE_TAGS="$CODE_TAGS" \
     LIFEBOAT_CODE_BYTES="$CODE_BYTES" \
+    LIFEBOAT_CODE_LFS="$CODE_LFS" \
+    LIFEBOAT_CODE_SUBMODULES="$CODE_SUBMODULES" \
     LIFEBOAT_GITHUB_ISSUES="$GITHUB_ISSUES" \
     LIFEBOAT_GITHUB_PULLS="$GITHUB_PULLS" \
     LIFEBOAT_GITHUB_COMMENTS="$GITHUB_COMMENTS" \
@@ -329,6 +345,7 @@ report() {
     LIFEBOAT_SETUP_FUNCTIONS="$SETUP_FUNCTIONS" \
     LIFEBOAT_SETUP_CRON_JOBS="$SETUP_CRON_JOBS" \
     LIFEBOAT_SETUP_BYTES="$SETUP_BYTES" \
+    LIFEBOAT_SETUP_SOURCE="$SETUP_SOURCE" \
     LIFEBOAT_VERCEL_SOURCE="$VERCEL_SOURCE" \
     LIFEBOAT_VERCEL_ENV_VARS="$VERCEL_ENV_VARS" \
     LIFEBOAT_VERCEL_ENV_VALUES="$VERCEL_ENV_VALUES" \
@@ -339,9 +356,12 @@ report() {
     LIFEBOAT_RESTORE_COPY="$RESTORE_COPY" \
     LIFEBOAT_COPIES_FILE="$COPIES_FILE" \
     LIFEBOAT_OPENED_FILE="$OPENED_FILE" \
+    LIFEBOAT_MONTHLY_STATE="$MONTHLY_STATE" \
+    LIFEBOAT_MONTHLY_REASON="$MONTHLY_REASON" \
     LIFEBOAT_ERROR="$LIFEBOAT_ERROR" \
     RETENTION_DAYS="$RETENTION_DAYS" \
     node "$ROOT/scripts/checkin.mjs" || checkin=$?
+  set +m
   if [[ "$checkin" -eq 2 ]]; then
     remove_unrecorded_monthly_copies
   fi
@@ -359,12 +379,28 @@ trap report EXIT
 # a signal ends it, but with the status of the last command that finished, usually 0, so without these the run checked
 # in as passed. Each exits with the shell's usual 128 plus the signal's number, which report turns into a failure.
 stopped() {
+  # One signal stops the run. Later ones must not stop its check-in, and they do come: bash in a $(...) that a SIGHUP
+  # ends sends SIGHUP again to its own process group, which is this worker's.
+  trap '' HUP INT TERM
   LIFEBOAT_ERROR="Lifeboat was stopped (SIG$1) before it finished, so this run proves nothing."
   exit "$2"
 }
 trap 'stopped HUP 129' HUP
 trap 'stopped INT 130' INT
 trap 'stopped TERM 143' TERM
+
+# A step before this script in the action failed, such as installing the Postgres client, so the run never started. The
+# action's closing step runs this script again with LIFEBOAT_SETUP_FAILED naming that step, and nothing else happens:
+# the run checks in as failed, saying which step, instead of never checking in.
+if [[ -n "${LIFEBOAT_SETUP_FAILED:-}" ]]; then
+  setup_run="the backup"
+  [[ "$MODE" != "restore-test" ]] || setup_run="the test restore"
+  case "$LIFEBOAT_SETUP_FAILED" in
+    postgres) fail "Lifeboat could not install the Postgres client on the runner, so ${setup_run} did not run. Its message is in this run's log in GitHub Actions." ;;
+    age) fail "Lifeboat could not set up the age encryption tool on the runner, so ${setup_run} did not run. Its message is in this run's log in GitHub Actions." ;;
+    *) fail "A setup step in the Lifeboat action failed, so ${setup_run} did not run. Its message is in this run's log in GitHub Actions." ;;
+  esac
+fi
 
 if [[ -n "${DATABASE_URL:-}" && -n "${RESTORE_DATABASE_URL:-}" && "$DATABASE_URL" == "$RESTORE_DATABASE_URL" ]]; then
   fail "Refusing to restore into DATABASE_URL."
@@ -501,12 +537,47 @@ code_failure_reason() {
 
 # aws s3 cp or sync, and on a failure, the sentence above in the check-in.
 s3_copy() {
-  local status=0 err
-  aws_s3 s3 "$@" 2>"$WORKDIR/aws.err" || status=$?
-  err="$(cat "$WORKDIR/aws.err")"
-  rm -f "$WORKDIR/aws.err"
-  [[ -z "$err" ]] || printf '%s\n' "$err" >&2
-  [[ "$status" -eq 0 ]] || fail "$(storage_failure_reason "$err")"
+  local status=0
+  run_step aws_s3 s3 "$@" || status=$?
+  [[ "$status" -eq 0 ]] || fail "$(storage_failure_reason "$STEP_ERR")"
+}
+
+# Runs a command, prints what it says on stderr to this log, and keeps that in STEP_ERR so the caller can pick a fixed
+# sentence for the check-in from it. Its stdout goes where the caller sends it. The message is held in memory, not in a
+# file in the work folder: on a full disk, that file would lose the very message that says so.
+STEP_ERR=""
+run_step() {
+  local status=0
+  { STEP_ERR="$("$@" 2>&1 1>&3 3>&-)"; } 3>&1 || status=$?
+  [[ -z "$STEP_ERR" ]] || printf '%s\n' "$STEP_ERR" >&2
+  return "$status"
+}
+
+# What the check-in says when tar cannot pack a copy into one archive, picked from tar's own message as for aws and git
+# above. tar's message names the files it was packing, so it stays in this log. Takes the message, then what was packed.
+# Without this, a full disk while packing ended the night as "Lifeboat failed with status 2".
+archive_failure_reason() {
+  case "$1" in
+    *"No space left on device"*|*"Wrote only"*)
+      echo "The runner ran out of disk while packing ${2} into one archive." ;;
+    *)
+      echo "tar could not pack ${2} into one archive. Its message is in this run's log in GitHub Actions." ;;
+  esac
+}
+
+# What the check-in says when the files cannot be read with the project's own Storage S3 keys, picked from aws's message
+# as above. Those keys are not the bucket's, so storage_failure_reason, which names the bucket's keys, would mislead.
+files_s3_failure_reason() {
+  case "$1" in
+    *InvalidAccessKeyId*|*SignatureDoesNotMatch*|*AccessDenied*|*"Access Denied"*|*Forbidden*|*"(403)"*)
+      echo "Supabase Storage refused the S3 access keys this workflow reads the files with. Check them in your project's Storage settings, or connect again in LastGood to make the storage login." ;;
+    *"Could not connect to the endpoint URL"*|*"Connect timeout"*|*"Read timeout"*|*"Connection reset"*|*"(503)"*|*SlowDown*|*ServiceUnavailable*)
+      echo "Supabase Storage didn't answer, or was too busy, while the files were copied. The next run tries again." ;;
+    *"No space left on device"*)
+      echo "The runner ran out of disk while copying the files from Supabase Storage." ;;
+    *)
+      echo "aws could not copy the files from Supabase Storage. Its message is in this run's log in GitHub Actions." ;;
+  esac
 }
 
 # What the check-in says when pg_dump fails, picked from pg_dump's own message. That message stays in this log, where
@@ -526,6 +597,8 @@ dump_failure_reason() {
       echo "pg_dump could not reach the database: it didn't answer. Supabase may be having an outage, or the project may be paused. The next backup tries again." ;;
     *"lock timeout"*)
       echo "pg_dump stopped: a table stayed locked for 10 minutes, usually by a long migration or a stuck session. The next backup tries again." ;;
+    *"row-level security policy"*)
+      echo "pg_dump stopped at a table with row level security: the backup login can't bypass it in this project, so it can't read every row. Write to hello@lastgood.app and we'll help." ;;
     *"permission denied"*)
       echo "pg_dump was refused read access to part of the database. Connect the repository again from LastGood to give its backup login access again." ;;
     *"No space left on device"*)
@@ -624,7 +697,8 @@ encrypt_file() {
   fi
   command -v openssl >/dev/null || fail "openssl is not installed on this runner."
   echo "This copy uses the older passphrase encryption, which cannot detect a changed copy. Run the connect wizard again to move to a key pair."
-  openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:LIFEBOAT_ENCRYPTION_PASSPHRASE -in "$source" -out "$dest"
+  openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:LIFEBOAT_ENCRYPTION_PASSPHRASE -in "$source" -out "$dest" ||
+    fail "openssl could not encrypt the copy, so it was not uploaded. Its message is in this run's log in GitHub Actions."
 }
 
 decrypt_age_file() {
@@ -649,7 +723,10 @@ decrypt_file() {
     fail "Set LIFEBOAT_ENCRYPTION_PASSPHRASE. The dump was encrypted with the passphrase kept in this repository."
   fi
   command -v openssl >/dev/null || fail "openssl is not installed on this runner."
-  openssl enc -d -aes-256-cbc -pbkdf2 -salt -pass env:LIFEBOAT_ENCRYPTION_PASSPHRASE -in "$source" -out "$dest"
+  if ! openssl enc -d -aes-256-cbc -pbkdf2 -salt -pass env:LIFEBOAT_ENCRYPTION_PASSPHRASE -in "$source" -out "$dest"; then
+    rm -f "$dest"
+    fail "This copy did not open with LIFEBOAT_ENCRYPTION_PASSPHRASE. Either it was made with another passphrase, or it was changed or damaged after it was made. It was not restored."
+  fi
 }
 
 apply_retention() {
@@ -658,7 +735,11 @@ apply_retention() {
     return
   fi
   local list="$WORKDIR/objects.json" plan="$WORKDIR/retention.plan"
-  aws_s3 s3api list-objects-v2 --bucket "$BUCKET" --prefix "${PREFIX}/" --output json >"$list"
+  # The listing and each delete used to end the night as "Lifeboat failed with status N". They say why, as the monthly
+  # copy's listing does, and that tonight's copies are up.
+  if ! run_step aws_s3 s3api list-objects-v2 --bucket "$BUCKET" --prefix "${PREFIX}/" --output json >"$list"; then
+    fail "Old copies were not deleted: $(storage_failure_reason "$STEP_ERR") Tonight's copies are in the bucket."
+  fi
   # Through a file, so a failure is seen: read with < <(...), a retention-days of 0 deleted nothing, night after
   # night, and the log never said. The night's copies are made by now, so it stays a good night, with a warning.
   if ! node "$ROOT/scripts/retention.mjs" "$list" "$RETENTION_DAYS" "$PREFIX" >"$plan" 2>"$WORKDIR/retention.err"; then
@@ -670,7 +751,10 @@ apply_retention() {
   local key
   while IFS= read -r key; do
     [[ -z "$key" ]] && continue
-    aws_s3 s3 rm "s3://${BUCKET}/${key}"
+    if ! run_step aws_s3 s3 rm "s3://${BUCKET}/${key}"; then
+      rm -f "$plan"
+      fail "Old copies were not all deleted: $(storage_failure_reason "$STEP_ERR") Tonight's copies are in the bucket."
+    fi
     DELETED_OBJECTS=$((DELETED_OBJECTS + 1))
   done <"$plan"
   rm -f "$plan"
@@ -703,6 +787,7 @@ monthly_files_due() {
 # a bucket whose own rule expires every object after the nightly window would delete the monthly copies with the rest.
 make_monthly_copies() {
   if [[ "$MONTHLY_COPIES" != "true" ]]; then
+    MONTHLY_STATE=off
     return
   fi
   # Own bucket: the copy goes beside the nightly ones and this job's retention keeps it twelve months. LastGood's
@@ -711,24 +796,24 @@ make_monthly_copies() {
   if [[ "$MANAGE_RETENTION" != "true" ]]; then
     if [[ -z "$MONTHLY_BUCKET" ]]; then
       echo "::warning::Monthly copies are on, but no monthly copy was made: this bucket's own rule decides how long copies are kept, and no monthly bucket is set. On your own bucket, set manage-retention to true to keep them for twelve months."
+      # The check-in says so too, so a month with no monthly copy doesn't read as good.
+      MONTHLY_STATE=none
+      MONTHLY_REASON=no-monthly-bucket
       return
     fi
     target="$MONTHLY_BUCKET"
   fi
   [[ -s "$COPIES_FILE" ]] || return 0
-  local month="${STAMP:0:6}" list="$WORKDIR/monthly.json" plan="$WORKDIR/monthly.plan" source dest err
+  local month="${STAMP:0:6}" list="$WORKDIR/monthly.json" plan="$WORKDIR/monthly.plan" source dest
   # Either failing used to end the night as "Lifeboat failed with status N", with nothing to say tonight's copies were up.
-  if ! aws_s3 s3api list-objects-v2 --bucket "$target" --prefix "${PREFIX}/monthly/${month}/" --output json >"$list" 2>"$WORKDIR/aws.err"; then
-    err="$(cat "$WORKDIR/aws.err")"
-    rm -f "$WORKDIR/aws.err"
-    [[ -z "$err" ]] || printf '%s\n' "$err" >&2
-    fail "This month's monthly copy was not made: $(storage_failure_reason "$err") Tonight's copies are in the bucket."
+  if ! run_step aws_s3 s3api list-objects-v2 --bucket "$target" --prefix "${PREFIX}/monthly/${month}/" --output json >"$list"; then
+    fail "This month's monthly copy was not made: $(storage_failure_reason "$STEP_ERR") Tonight's copies are in the bucket."
   fi
-  rm -f "$WORKDIR/aws.err"
   node "$ROOT/scripts/monthly.mjs" "$list" "$COPIES_FILE" "$PREFIX" "$month" >"$plan" ||
     fail "This month's monthly copy was not made: the bucket's list of monthly copies could not be read. Tonight's copies are in the bucket, and the next backup tries the monthly copy again."
   if [[ ! -s "$plan" && ! -s "$WORKDIR/monthly-storage.tar" ]]; then
     echo "This month's monthly copy is already in ${PREFIX}/monthly/${month}/."
+    MONTHLY_STATE=already
     return
   fi
   while IFS=$'\t' read -r source dest; do
@@ -747,6 +832,8 @@ make_monthly_copies() {
     rm -f "$WORKDIR/monthly-storage.tar"
     echo "Monthly copy kept for twelve months: ${dest}"
   fi
+  # Only once every copy is up: one that fails has ended the night above, and its error says why.
+  MONTHLY_STATE=made
 }
 
 # The newest key under <prefix>/<part>/ that ends with one of the suffixes. Keys start with a UTC stamp, so the last one sorted is the newest.
@@ -829,11 +916,19 @@ copy_age_note() {
   ' "$1" "$STALE_COPY_HOURS"
 }
 
+# aws with the project's own Storage S3 keys, for the files: not the bucket's keys.
+project_storage_s3() {
+  AWS_ACCESS_KEY_ID="$STORAGE_S3_ACCESS_KEY_ID" \
+    AWS_SECRET_ACCESS_KEY="$STORAGE_S3_SECRET_ACCESS_KEY" \
+    AWS_DEFAULT_REGION="${STORAGE_S3_REGION:-us-east-1}" \
+    aws --endpoint-url "$STORAGE_S3_ENDPOINT" "$@"
+}
+
 # Supabase Storage files. With the storage login setup made (D4), the workflow signs in through the Storage API and
 # reads every bucket; with S3 keys for the project's storage, it syncs every bucket. Without either, the files are
 # left out and the log says so. A login that cannot read fails the run after the other copies, like the setup copy.
 copy_storage() {
-  local root="$WORKDIR/storage"
+  local root="$WORKDIR/storage" objects
   rm -rf "$root" "$WORKDIR/storage.tar" "$WORKDIR/storage.err"
   if [[ -n "${LIFEBOAT_STORAGE_LOGIN:-}" ]]; then
     STORAGE_SOURCE="login"
@@ -847,33 +942,35 @@ copy_storage() {
       return
     fi
     rm -f "$WORKDIR/storage.err"
-    read -r buckets STORAGE_OBJECTS bytes <<<"$counts"
-    echo "Files: $(counted "$STORAGE_OBJECTS" file) in $(counted "$buckets" bucket), ${bytes} bytes, read with the storage login."
-    storage_shortfall "$root"
+    read -r buckets objects bytes <<<"$counts"
+    echo "Files: $(counted "$objects" file) in $(counted "$buckets" bucket), ${bytes} bytes, read with the storage login."
+    storage_shortfall "$root" "$objects"
   elif [[ -n "${STORAGE_S3_ENDPOINT:-}" && -n "${STORAGE_S3_ACCESS_KEY_ID:-}" && -n "${STORAGE_S3_SECRET_ACCESS_KEY:-}" ]]; then
     STORAGE_SOURCE="s3"
-    local storage_region="${STORAGE_S3_REGION:-us-east-1}"
     local names name
-    names="$(
-      AWS_ACCESS_KEY_ID="$STORAGE_S3_ACCESS_KEY_ID" \
-        AWS_SECRET_ACCESS_KEY="$STORAGE_S3_SECRET_ACCESS_KEY" \
-        AWS_DEFAULT_REGION="$storage_region" \
-        aws --endpoint-url "$STORAGE_S3_ENDPOINT" s3 ls | awk '{print $3}'
-    )"
+    # A listing or a download that fails is a failed part, as a storage login that cannot read is above.
+    if ! run_step project_storage_s3 s3 ls >"$WORKDIR/storage-buckets.txt"; then
+      rm -f "$WORKDIR/storage-buckets.txt"
+      part_failed files "$(files_s3_failure_reason "$STEP_ERR") Nothing was uploaded for the files."
+      return
+    fi
+    names="$(awk '{print $3}' "$WORKDIR/storage-buckets.txt")"
+    rm -f "$WORKDIR/storage-buckets.txt"
     mkdir -p "$root"
     for name in $names; do
       mkdir -p "$root/$name"
-      AWS_ACCESS_KEY_ID="$STORAGE_S3_ACCESS_KEY_ID" \
-        AWS_SECRET_ACCESS_KEY="$STORAGE_S3_SECRET_ACCESS_KEY" \
-        AWS_DEFAULT_REGION="$storage_region" \
-        aws --endpoint-url "$STORAGE_S3_ENDPOINT" s3 sync "s3://${name}" "$root/$name"
+      if ! run_step project_storage_s3 s3 sync "s3://${name}" "$root/$name"; then
+        rm -rf "$root"
+        part_failed files "$(files_s3_failure_reason "$STEP_ERR") Nothing was uploaded for the files."
+        return
+      fi
     done
     # aws s3 sync dates each file it downloads with the date it was last changed in the project. Unencrypted, the
     # upload sync below would then skip any file older than its copy in the bucket, so a file nobody changed kept its
     # first upload's date there and retention deleted it after RETENTION_DAYS, while the nights still read as good.
     # Dated now, every file goes up each night, as files read with the storage login always have.
     find "$root" -type f -exec touch {} +
-    STORAGE_OBJECTS="$(find "$root" -type f | wc -l | tr -d ' ')"
+    objects="$(find "$root" -type f | wc -l | tr -d ' ')"
   else
     STORAGE_SOURCE="none"
     echo "Storage copy skipped: LIFEBOAT_STORAGE_LOGIN is not set, so your files are not in this copy. Connect again in LastGood to make the storage login."
@@ -884,12 +981,18 @@ copy_storage() {
     suffix="$(encrypted_suffix)"
     # Each step deletes what the next doesn't need, so the runner holds at most two copies of the files at once (the
     # folder and the archive, then the archive and the encrypted archive), not three.
-    tar -C "$root" -cf "$WORKDIR/storage.tar" .
+    if ! run_step tar -C "$root" -cf "$WORKDIR/storage.tar" .; then
+      rm -rf "$root" "$WORKDIR/storage.tar"
+      part_failed files "$(archive_failure_reason "$STEP_ERR" "the files") Nothing was uploaded for the files."
+      return
+    fi
     rm -rf "$root"
     encrypt_file "$WORKDIR/storage.tar" "$WORKDIR/storage.tar${suffix}"
     rm -f "$WORKDIR/storage.tar"
     s3_copy cp "$WORKDIR/storage.tar${suffix}" "s3://${BUCKET}/${PREFIX}/storage/${STAMP}.tar${suffix}"
     record_copy "$WORKDIR/storage.tar${suffix}" "${PREFIX}/storage/${STAMP}.tar${suffix}"
+    # The count goes in the check-in only once the copy is up: a night whose files copy failed reports none.
+    STORAGE_OBJECTS="$objects"
     rm -f "$WORKDIR/storage.tar${suffix}"
   else
     # Every bucket folder, one whose name starts with a dot too: a glob would pass it over, and its files, counted in
@@ -898,10 +1001,13 @@ copy_storage() {
     while IFS= read -r -d '' dest; do
       s3_copy sync "$dest/" "s3://${BUCKET}/${PREFIX}/storage/$(basename "$dest")"
     done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -print0)
+    STORAGE_OBJECTS="$objects"
     # Synced one by one into a folder each night updates, the files leave no copy of tonight for the month to keep. So
     # while they are on the runner, the month's first night keeps them as one archive, which the monthly copy uploads.
-    if monthly_files_due; then
-      tar -C "$root" -cf "$WORKDIR/monthly-storage.tar" .
+    # Tonight's files are up by now, so an archive that cannot be made fails the monthly copy, not the files.
+    if monthly_files_due && ! run_step tar -C "$root" -cf "$WORKDIR/monthly-storage.tar" .; then
+      rm -f "$WORKDIR/monthly-storage.tar"
+      part_failed "monthly copy" "This month's monthly copy was not made: $(archive_failure_reason "$STEP_ERR" "the files") Tonight's files are in the bucket, and the next backup tries the monthly copy again."
     fi
   fi
   rm -rf "$root" "$WORKDIR/storage.tar"
@@ -915,15 +1021,16 @@ copy_storage() {
 # them, or when pg_restore cannot list the dump, it says nothing and the copy stands as it is.
 # A copy far short of the dump is hidden files at once. Otherwise every file the dump lists is looked for in the copy,
 # and the live database is asked, read only, which of the ones not there are still in storage.objects: a file that is
-# still there was hidden, however few of them there are, and one that is gone was deleted between the two.
+# still there was hidden, however few of them there are, and one that is gone was deleted between the two. Takes the
+# copy's folder, then how many files it holds: the check-in's count waits until the copy is up.
 STORAGE_HIDDEN=""
 storage_shortfall() {
-  local root="$1" check state missing dumped answer still buckets
+  local root="$1" objects="$2" check state missing dumped answer still buckets
   "$PG_RESTORE" --list "$WORKDIR/dump.backup" >"$WORKDIR/storage.toc" 2>/dev/null || {
     rm -f "$WORKDIR/storage.toc"
     return 0
   }
-  check="$(LIFEBOAT_PG_RESTORE="$PG_RESTORE" node "$ROOT/scripts/restore-list.mjs" storage-check "$WORKDIR/storage.toc" "$WORKDIR/dump.backup" "$STORAGE_OBJECTS" "$root" "$WORKDIR/storage-still.sql" 2>/dev/null || echo none)"
+  check="$(LIFEBOAT_PG_RESTORE="$PG_RESTORE" node "$ROOT/scripts/restore-list.mjs" storage-check "$WORKDIR/storage.toc" "$WORKDIR/dump.backup" "$objects" "$root" "$WORKDIR/storage-still.sql" 2>/dev/null || echo none)"
   rm -f "$WORKDIR/storage.toc"
   read -r state missing dumped <<<"$check"
   if [[ "$state" == ask ]]; then
@@ -946,7 +1053,7 @@ storage_shortfall() {
   fi
   case "$state" in
     hidden)
-      STORAGE_HIDDEN="The storage login copied $(counted "$STORAGE_OBJECTS" file) of the ${dumped} your database listed a moment earlier, so a storage policy hides ${missing} from it. A restrictive policy does this, such as one that needs two-factor sign-in (aal2). Change it to leave out the storage login (lastgood-backup@lastgood.invalid), or those files are not in your backups."
+      STORAGE_HIDDEN="The storage login copied $(counted "$objects" file) of the ${dumped} your database listed a moment earlier, so a storage policy hides ${missing} from it. A restrictive policy does this, such as one that needs two-factor sign-in (aal2). Change it to leave out the storage login (lastgood-backup@lastgood.invalid), or those files are not in your backups."
       ;;
     note)
       echo "Files: the database dump lists $(counted "$missing" file) more than the files copy holds, most likely deleted between the two. The next run copies what is there then."
@@ -962,7 +1069,14 @@ count_auth_users() {
   local dump="$1" counts reason
   "$PG_RESTORE" --list "$dump" >"$WORKDIR/backup.toc" || fail "pg_restore could not list the dump it just made."
   if ! counts="$(LIFEBOAT_PG_RESTORE="$PG_RESTORE" node "$ROOT/scripts/restore-list.mjs" auth-count "$WORKDIR/backup.toc" "$dump" 2>"$WORKDIR/auth.err")"; then
+    # restore-list.mjs's own sentences go in the check-in. Anything else is pg_restore's (or node's) message, which
+    # stays in this log only, as for pg_dump.
+    cat "$WORKDIR/auth.err" >&2
     reason="$(tail -n 1 "$WORKDIR/auth.err")"
+    case "$reason" in
+      "The dump has the auth.users table but none of its rows,"*|"pg_restore did not return the auth."*) ;;
+      *) reason="pg_restore could not read the users back out of the dump it just made, so they were not counted. Its message is in this run's log in GitHub Actions." ;;
+    esac
     rm -f "$WORKDIR/backup.toc" "$WORKDIR/auth.err"
     if [[ -n "$PART_ERRORS" ]]; then
       FAILED_PARTS=("users check" "${FAILED_PARTS[@]}")
@@ -1002,20 +1116,27 @@ copy_code() {
   mask "$basic"
   # A bare clone holds every branch and every tag, including tags on branches that were deleted. A copy that cannot be
   # made fails the code part only, so the Supabase setup, the Vercel copy and the users check still run tonight.
-  local status=0 err
+  local status=0
   GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${basic}" \
-    git clone --bare --quiet "${server}/${repository}.git" "$dir/repo.git" 2>"$WORKDIR/git.err" || status=$?
-  err="$(cat "$WORKDIR/git.err")"
-  rm -f "$WORKDIR/git.err"
-  [[ -z "$err" ]] || printf '%s\n' "$err" >&2
+    run_step git clone --bare --quiet "${server}/${repository}.git" "$dir/repo.git" || status=$?
   if (( status != 0 )); then
     rm -rf "$dir"
-    part_failed code "$(code_failure_reason "$err" "$repository") Nothing was uploaded for the code."
+    part_failed code "$(code_failure_reason "$STEP_ERR" "$repository") Nothing was uploaded for the code."
     return
   fi
-  local branches tags
+  local branches tags lfs=false submodules=""
   branches="$(git -C "$dir/repo.git" for-each-ref --format='%(refname)' refs/heads | wc -l | tr -d ' ')"
   tags="$(git -C "$dir/repo.git" for-each-ref --format='%(refname)' refs/tags | wc -l | tr -d ' ')"
+  # Git LFS keeps files outside git, so the bundle holds only their pointers. The default branch's .gitattributes say
+  # whether the repository uses it; in a pathspec * crosses /, so nested ones count. An unborn HEAD reads as no.
+  if (( branches > 0 )) && git -C "$dir/repo.git" grep -q -e 'filter=lfs' HEAD -- .gitattributes '*/.gitattributes' 2>/dev/null; then
+    lfs=true
+  fi
+  # A submodule is a gitlink in the tree (mode 160000): the commit it points at, never its files, so the bundle holds
+  # none of them. Counted on the default branch, as Git LFS is above. A tree git cannot read gives no count, never 0.
+  if (( branches > 0 )); then
+    submodules="$(git -C "$dir/repo.git" ls-tree -r --full-tree HEAD 2>/dev/null | awk '$1 == "160000" { n++ } END { print n + 0 }')" || submodules=""
+  fi
   if (( branches + tags > 0 )); then
     if ! git -C "$dir/repo.git" bundle create --quiet "$dir/code.bundle" --all; then
       rm -rf "$dir"
@@ -1043,7 +1164,11 @@ copy_code() {
   rm -f "$WORKDIR/metadata.err"
   local issues pulls comments
   read -r issues pulls comments <<<"$counts"
-  tar -C "$dir" -czf "$WORKDIR/code.tar.gz" .
+  if ! run_step tar -C "$dir" -czf "$WORKDIR/code.tar.gz" .; then
+    rm -rf "$dir" "$WORKDIR/code.tar.gz"
+    part_failed code "$(archive_failure_reason "$STEP_ERR" "the code") Nothing was uploaded for the code."
+    return
+  fi
   local suffix
   suffix="$(encrypted_suffix)"
   if [[ -n "$suffix" ]]; then
@@ -1055,9 +1180,19 @@ copy_code() {
   CODE_BRANCHES="$branches"
   CODE_TAGS="$tags"
   CODE_BYTES="$(wc -c <"$WORKDIR/code.tar.gz" | tr -d ' ')"
+  CODE_LFS="$lfs"
+  CODE_SUBMODULES="$submodules"
   read -r GITHUB_ISSUES GITHUB_PULLS GITHUB_COMMENTS <<<"$counts"
   rm -rf "$dir" "$WORKDIR/code.tar.gz" "$WORKDIR/code.tar.gz${suffix}"
   echo "Code: ${CODE_BRANCHES} branches, ${CODE_TAGS} tags. GitHub: ${issues} issues, ${pulls} pull requests, ${comments} comments."
+  if [[ "$CODE_LFS" == true ]]; then
+    echo "::warning::${repository} keeps files in Git LFS. The code copy holds their pointers, not the files, so keep a copy of the LFS files yourself."
+  fi
+  if [[ "$CODE_SUBMODULES" == 1 ]]; then
+    echo "::warning::${repository} uses 1 submodule. The code copy holds only the commit it points at, not its files, so back up that repository as well."
+  elif [[ "$CODE_SUBMODULES" =~ ^[1-9][0-9]*$ ]]; then
+    echo "::warning::${repository} uses ${CODE_SUBMODULES} submodules. The code copy holds only the commit each one points at, not its files, so back up those repositories as well."
+  fi
 }
 
 # The project ref from the Session pooler username, role.<project-ref>, unless supabase-project-ref names it.
@@ -1105,6 +1240,7 @@ part_errors() {
 
 copy_supabase_setup() {
   if [[ -z "${LIFEBOAT_SUPABASE_TOKEN:-}" ]]; then
+    SETUP_SOURCE="none"
     echo "Supabase setup copy skipped: LIFEBOAT_SUPABASE_TOKEN is not set, so Edge Functions and Supabase settings are not in this copy."
     return
   fi
@@ -1113,6 +1249,7 @@ copy_supabase_setup() {
     echo "::warning::Supabase setup copy skipped: encryption is off, and the auth settings can hold provider secrets. Turn encrypt on to copy Edge Functions and Supabase settings."
     return
   fi
+  SETUP_SOURCE="token"
   local ref
   ref="$(supabase_project_ref)"
   if [[ ! "$ref" =~ ^[a-z]{20}$ ]]; then
@@ -1132,15 +1269,24 @@ copy_supabase_setup() {
   fi
   cat "$WORKDIR/setup.err"
   rm -f "$WORKDIR/setup.err"
-  local webhooks vault
-  read -r SETUP_FUNCTIONS SETUP_CRON_JOBS webhooks vault <<<"$counts"
-  tar -C "$dir" -czf "$WORKDIR/setup.tar.gz" .
-  SETUP_BYTES="$(wc -c <"$WORKDIR/setup.tar.gz" | tr -d ' ')"
+  local functions cron_jobs webhooks vault
+  read -r functions cron_jobs webhooks vault <<<"$counts"
+  if ! run_step tar -C "$dir" -czf "$WORKDIR/setup.tar.gz" .; then
+    rm -rf "$dir" "$WORKDIR/setup.tar.gz"
+    part_failed "Supabase setup" "$(archive_failure_reason "$STEP_ERR" "the Supabase setup") Nothing was uploaded for the Supabase setup."
+    return
+  fi
+  local bytes
+  bytes="$(wc -c <"$WORKDIR/setup.tar.gz" | tr -d ' ')"
   local suffix
   suffix="$(encrypted_suffix)"
   encrypt_file "$WORKDIR/setup.tar.gz" "$WORKDIR/setup.tar.gz${suffix}"
   s3_copy cp "$WORKDIR/setup.tar.gz${suffix}" "s3://${BUCKET}/${PREFIX}/setup/${STAMP}.tar.gz${suffix}"
   record_copy "$WORKDIR/setup.tar.gz${suffix}" "${PREFIX}/setup/${STAMP}.tar.gz${suffix}"
+  # The counts go in the check-in only once the copy is up: a night whose setup copy failed reports none.
+  SETUP_FUNCTIONS="$functions"
+  SETUP_CRON_JOBS="$cron_jobs"
+  SETUP_BYTES="$bytes"
   rm -rf "$dir" "$WORKDIR/setup.tar.gz" "$WORKDIR/setup.tar.gz${suffix}"
   echo "Supabase setup: ${SETUP_FUNCTIONS} Edge Functions, auth and storage settings, ${SETUP_CRON_JOBS} cron jobs, ${webhooks} database webhooks, ${vault} Vault secret names."
 }
@@ -1172,18 +1318,23 @@ copy_vercel_env() {
     return
   fi
   rm -f "$WORKDIR/vercel.err"
-  local without
-  read -r VERCEL_ENV_VARS VERCEL_ENV_VALUES without <<<"$counts"
+  local variables values without
+  read -r variables values without <<<"$counts"
   # The settings are their own part: if they fail, the environment variables still go up and the run then fails.
-  local settings settings_failed=""
+  local settings settings_failed="" domains="" records="" unreadable=""
   if settings="$(node "$ROOT/scripts/vercel-settings.mjs" "$dir/settings.json" 2>"$WORKDIR/vercel.err")"; then
-    read -r VERCEL_DOMAINS VERCEL_DNS_RECORDS VERCEL_DNS_UNREADABLE <<<"$settings"
+    read -r domains records unreadable <<<"$settings"
   else
     settings_failed="$(tail -n 1 "$WORKDIR/vercel.err")"
     rm -f "$dir/settings.json"
   fi
   rm -f "$WORKDIR/vercel.err"
-  tar -C "$dir" -czf "$WORKDIR/vercel.tar.gz" .
+  # A partly written archive holds the values in the clear, so it goes with the folder.
+  if ! run_step tar -C "$dir" -czf "$WORKDIR/vercel.tar.gz" .; then
+    rm -rf "$dir" "$WORKDIR/vercel.tar.gz"
+    part_failed Vercel "$(archive_failure_reason "$STEP_ERR" "the Vercel copy") Nothing was uploaded for Vercel."
+    return
+  fi
   local suffix
   suffix="$(encrypted_suffix)"
   encrypt_file "$WORKDIR/vercel.tar.gz" "$WORKDIR/vercel.tar.gz${suffix}"
@@ -1191,6 +1342,12 @@ copy_vercel_env() {
   rm -rf "$dir" "$WORKDIR/vercel.tar.gz"
   s3_copy cp "$WORKDIR/vercel.tar.gz${suffix}" "s3://${BUCKET}/${PREFIX}/vercel/${STAMP}.tar.gz${suffix}"
   record_copy "$WORKDIR/vercel.tar.gz${suffix}" "${PREFIX}/vercel/${STAMP}.tar.gz${suffix}"
+  # The counts go in the check-in only once the copy is up: a night whose Vercel copy failed reports none.
+  VERCEL_ENV_VARS="$variables"
+  VERCEL_ENV_VALUES="$values"
+  VERCEL_DOMAINS="$domains"
+  VERCEL_DNS_RECORDS="$records"
+  VERCEL_DNS_UNREADABLE="$unreadable"
   rm -f "$WORKDIR/vercel.tar.gz${suffix}"
   echo "Vercel: ${VERCEL_ENV_VARS} environment variables, ${VERCEL_ENV_VALUES} with their values."
   if (( without > 0 )); then
@@ -1286,10 +1443,10 @@ restore_code() {
     fail "${reason:-The GitHub metadata in the code copy did not read back.} (${name})"
   fi
   rm -f "$WORKDIR/metadata.err"
-  read -r GITHUB_ISSUES GITHUB_PULLS GITHUB_COMMENTS <<<"$counts"
   if [[ ! -f "$dir/code.bundle" ]]; then
     CODE_BRANCHES=0
     CODE_TAGS=0
+    read -r GITHUB_ISSUES GITHUB_PULLS GITHUB_COMMENTS <<<"$counts"
     rm -rf "$dir"
     echo "Code: ${name} holds no commits, because the repository had none when it was copied. GitHub: ${GITHUB_ISSUES} issues, ${GITHUB_PULLS} pull requests, ${GITHUB_COMMENTS} comments read back."
     return
@@ -1302,8 +1459,9 @@ restore_code() {
     rm -rf "$dir"
     fail "git fsck found damaged objects in the code copy ${name}. The code copy did not restore."
   fi
-  CODE_BRANCHES="$(git -C "$dir/restored.git" for-each-ref --format='%(refname)' refs/heads | wc -l | tr -d ' ')"
-  CODE_TAGS="$(git -C "$dir/restored.git" for-each-ref --format='%(refname)' refs/tags | wc -l | tr -d ' ')"
+  local branches tags
+  branches="$(git -C "$dir/restored.git" for-each-ref --format='%(refname)' refs/heads | wc -l | tr -d ' ')"
+  tags="$(git -C "$dir/restored.git" for-each-ref --format='%(refname)' refs/tags | wc -l | tr -d ' ')"
   local sample=""
   if git -C "$dir/restored.git" rev-parse --verify --quiet HEAD >/dev/null; then
     # sed reads to the end, so git never sees a closed pipe.
@@ -1314,6 +1472,10 @@ restore_code() {
     fail "A file on the default branch did not read back from the code copy ${name}. The code copy did not restore."
   fi
   rm -rf "$dir"
+  # The counts go in the check-in only once every check has passed: a test whose code copy failed reports none.
+  CODE_BRANCHES="$branches"
+  CODE_TAGS="$tags"
+  read -r GITHUB_ISSUES GITHUB_PULLS GITHUB_COMMENTS <<<"$counts"
   echo "Code: ${CODE_BRANCHES} branches and ${CODE_TAGS} tags cloned back out of ${name}, and git fsck found no damage. GitHub: ${GITHUB_ISSUES} issues, ${GITHUB_PULLS} pull requests, ${GITHUB_COMMENTS} comments read back."
 }
 
@@ -1497,10 +1659,49 @@ restore_db_answers() {
   return 1
 }
 
+# psql on the throwaway database. It answered before anything was downloaded, so a query that fails now means it stopped
+# answering: psql's message stays in this log, and the check-in says so instead of "Lifeboat failed with status 2".
+restore_db_psql() {
+  "$PSQL" "$RESTORE_DATABASE_URL" "$@" ||
+    fail "The throwaway database for the test restore stopped answering part way through, so the test restore did not finish. The next test restore tries again."
+}
+
+# What the check-in says when the test restore fails, picked from the message of the step that failed, as for pg_dump
+# above. restore-list.mjs names the table or quotes pg_restore's line, which can name a table, a file or a row, so its
+# message stays in this log. Takes the step (load, sample or users), then its message.
+restore_failure_reason() {
+  case "$1:$2" in
+    load:*"stopped by signal"*)
+      echo "pg_restore was stopped before the database copy finished loading, most likely because the runner ran out of memory." ;;
+    load:*"shared memory"*)
+      # Docker's small /dev/shm says "No space left on device" too, but it is memory, not disk.
+      echo "pg_restore could not load the database copy into the throwaway database. Its message is in this run's log in GitHub Actions." ;;
+    load:*"No space left on device"*)
+      echo "The runner ran out of disk while the database copy was loaded into the throwaway database." ;;
+    load:*)
+      echo "pg_restore could not load the database copy into the throwaway database. Its message is in this run's log in GitHub Actions." ;;
+    sample:*"Row count mismatch"*)
+      echo "A table in the throwaway database came back with a different number of rows than the database copy holds. The table is named in this run's log in GitHub Actions." ;;
+    sample:*)
+      echo "The database copy was restored, but its row counts could not be compared. Its message is in this run's log in GitHub Actions." ;;
+    users:*"Users did not come back"*)
+      echo "The users did not all come back: the throwaway database has a different number of accounts, passwords or sign-in identities than the database copy. The counts are in this run's log in GitHub Actions." ;;
+    users:*)
+      echo "The database copy was restored, but its users could not be checked. Its message is in this run's log in GitHub Actions." ;;
+  esac
+}
+
 postgis_plan() {
-  "$PSQL" "$RESTORE_DATABASE_URL" --no-psqlrc --tuples-only --no-align --command "SELECT name FROM pg_available_extensions" >"$WORKDIR/extensions.txt"
+  restore_db_psql --no-psqlrc --tuples-only --no-align --command "SELECT name FROM pg_available_extensions" >"$WORKDIR/extensions.txt"
   node "$ROOT/scripts/restore-list.mjs" postgis-plan "$WORKDIR/restore.toc" "$WORKDIR/restore.schema.sql" "$WORKDIR/extensions.txt" "$WORKDIR/postgis.plan" "${1:-}"
   mapfile -t POSTGIS_PLAN <"$WORKDIR/postgis.plan"
+}
+
+# A PostGIS plan that stops the test restore: its whole message goes to this log, and the check-in gets the plan's
+# short form, which fits. $1 is for a plan that came back empty.
+postgis_stop() {
+  [[ -z "${POSTGIS_PLAN[1]:-}" ]] || echo "${POSTGIS_PLAN[1]}" >&2
+  fail "${POSTGIS_PLAN[6]:-$1}"
 }
 
 ensure_postgis() {
@@ -1519,10 +1720,10 @@ ensure_postgis() {
       export RESTORE_DATABASE_URL="$url"
       mask "$RESTORE_DATABASE_URL"
       postgis_plan switched
-      [[ "${POSTGIS_PLAN[0]:-}" == "ok" ]] || fail "${POSTGIS_PLAN[1]:-The PostGIS image ${image} did not offer PostGIS. The restore test stopped before restoring.}"
+      [[ "${POSTGIS_PLAN[0]:-}" == "ok" ]] || postgis_stop "The PostGIS image ${image} did not offer PostGIS. The restore test stopped before restoring."
       echo "${POSTGIS_PLAN[1]}"
       ;;
-    *) fail "${POSTGIS_PLAN[1]:-The PostGIS check failed. The restore test stopped before restoring.}" ;;
+    *) postgis_stop "The PostGIS check failed. The restore test stopped before restoring." ;;
   esac
   rm -f "$WORKDIR/restore.schema.sql" "$WORKDIR/postgis.plan"
 }
@@ -1538,11 +1739,8 @@ if [[ "$MODE" == "backup" ]]; then
   # Read-only. pg_dump does not write to the source database. It gives up after 10 minutes waiting for a table
   # another session holds locked (a long migration, say), so the night fails and is reported instead of hanging.
   dump_status=0
-  "$PG_DUMP" "$DATABASE_URL" --format=custom --no-owner --no-acl --lock-wait-timeout=10min --file "$WORKDIR/dump.backup" 2>"$WORKDIR/pg_dump.err" || dump_status=$?
-  cat "$WORKDIR/pg_dump.err" >&2
-  [[ "$dump_status" -eq 0 ]] || fail "$(dump_failure_reason "$(cat "$WORKDIR/pg_dump.err")")"
-  rm -f "$WORKDIR/pg_dump.err"
-  DUMP_BYTES="$(wc -c <"$WORKDIR/dump.backup" | tr -d ' ')"
+  run_step "$PG_DUMP" "$DATABASE_URL" --format=custom --no-owner --no-acl --lock-wait-timeout=10min --file "$WORKDIR/dump.backup" || dump_status=$?
+  [[ "$dump_status" -eq 0 ]] || fail "$(dump_failure_reason "$STEP_ERR")"
   if [[ "$ENCRYPT" == "true" ]]; then
     suffix="$(encrypted_suffix)"
     encrypt_file "$WORKDIR/dump.backup" "$WORKDIR/dump.backup${suffix}"
@@ -1555,6 +1753,8 @@ if [[ "$MODE" == "backup" ]]; then
     s3_copy cp "$WORKDIR/dump.backup" "s3://${BUCKET}/${PREFIX}/db/${STAMP}.backup"
     record_copy "$WORKDIR/dump.backup" "${PREFIX}/db/${STAMP}.backup"
   fi
+  # The size goes in the check-in only once the copy is up: a night whose database copy failed reports none.
+  DUMP_BYTES="$(wc -c <"$WORKDIR/dump.backup" | tr -d ' ')"
   copy_storage
   copy_code
   copy_supabase_setup
@@ -1571,7 +1771,12 @@ elif [[ "$MODE" == "restore-test" ]]; then
   # any download, instead of the month's test restore never checking in.
   restore_db_answers "$RESTORE_DATABASE_URL" ||
     fail "The throwaway database for the test restore did not answer, so nothing was restored. The workflow's Start the restore database step says why."
-  key="$(latest_dump_key)" || fail "No .backup object was found under ${PREFIX}/db/."
+  # As for the code, setup and files copies: a listing the bucket refused is not an empty folder.
+  list_status=0
+  key="$(latest_dump_key)" || list_status=$?
+  (( list_status != 3 )) || fail "No .backup object was found under ${PREFIX}/db/."
+  (( list_status == 0 )) ||
+    fail "The database copies under ${PREFIX}/db/ could not be listed, so nothing was restored. Its message is in this run's log in GitHub Actions."
   RESTORE_COPY="${key##*/}"
   copy_age_note "$RESTORE_COPY"
   s3_copy cp "s3://${BUCKET}/${key}" "$WORKDIR/restore.download"
@@ -1589,39 +1794,46 @@ elif [[ "$MODE" == "restore-test" ]]; then
   else
     mv "$WORKDIR/restore.download" "$WORKDIR/restore.backup"
   fi
-  DUMP_BYTES="$(wc -c <"$WORKDIR/restore.backup" | tr -d ' ')"
+  dump_bytes="$(wc -c <"$WORKDIR/restore.backup" | tr -d ' ')"
   avail_kb="$(df -Pk "$WORKDIR" | awk 'NR==2 {print $4}')"
-  echo "Restore disk free: ${avail_kb} KiB. Dump bytes: ${DUMP_BYTES}."
-  if [[ "$avail_kb" =~ ^[0-9]+$ ]] && (( avail_kb * 1024 < DUMP_BYTES )); then
+  echo "Restore disk free: ${avail_kb} KiB. Dump bytes: ${dump_bytes}."
+  if [[ "$avail_kb" =~ ^[0-9]+$ ]] && (( avail_kb * 1024 < dump_bytes )); then
     fail "Not enough free disk to restore this dump."
   fi
   assert_client_can_read "$RESTORE_DATABASE_URL"
-  "$PG_RESTORE" --list "$WORKDIR/restore.backup" >"$WORKDIR/restore.toc"
+  # pg_restore's message stays in this log. Before, a copy it could not read checked in as "failed with status 1".
+  "$PG_RESTORE" --list "$WORKDIR/restore.backup" >"$WORKDIR/restore.toc" ||
+    fail "pg_restore could not read the database copy, so nothing was restored. The copy may be damaged, or made by a newer pg_dump than this runner's pg_restore. Its message is in this run's log in GitHub Actions."
   ensure_postgis
-  "$PSQL" "$RESTORE_DATABASE_URL" --no-psqlrc --tuples-only --no-align --command "SELECT nspname FROM pg_namespace" >"$WORKDIR/schemas.txt"
-  "$PSQL" "$RESTORE_DATABASE_URL" --no-psqlrc --tuples-only --no-align --command "SELECT pubname FROM pg_publication" >"$WORKDIR/publications.txt"
-  "$PSQL" "$RESTORE_DATABASE_URL" --no-psqlrc --tuples-only --no-align --command "SELECT evtname FROM pg_event_trigger" >"$WORKDIR/event_triggers.txt"
+  restore_db_psql --no-psqlrc --tuples-only --no-align --command "SELECT nspname FROM pg_namespace" >"$WORKDIR/schemas.txt"
+  restore_db_psql --no-psqlrc --tuples-only --no-align --command "SELECT pubname FROM pg_publication" >"$WORKDIR/publications.txt"
+  restore_db_psql --no-psqlrc --tuples-only --no-align --command "SELECT evtname FROM pg_event_trigger" >"$WORKDIR/event_triggers.txt"
   node "$ROOT/scripts/restore-list.mjs" drop-sql "$WORKDIR/restore.toc" "$WORKDIR/schemas.txt" "$WORKDIR/drop.sql" "$WORKDIR/publications.txt" "$WORKDIR/event_triggers.txt"
   if [[ -s "$WORKDIR/drop.sql" ]]; then
     # One object that will not drop must not hide the rest. Leftovers are warnings.
-    "$PSQL" "$RESTORE_DATABASE_URL" --no-psqlrc --set ON_ERROR_STOP=0 --file "$WORKDIR/drop.sql"
+    restore_db_psql --no-psqlrc --set ON_ERROR_STOP=0 --file "$WORKDIR/drop.sql"
   fi
-  "$PSQL" "$RESTORE_DATABASE_URL" --no-psqlrc --tuples-only --no-align --command "SELECT name FROM pg_available_extensions" >"$WORKDIR/extensions.txt"
-  "$PSQL" "$RESTORE_DATABASE_URL" --no-psqlrc --tuples-only --no-align --command "SELECT nspname FROM pg_namespace" >"$WORKDIR/schemas.txt"
-  "$PSQL" "$RESTORE_DATABASE_URL" --no-psqlrc --tuples-only --no-align --command "SELECT extname FROM pg_extension" >"$WORKDIR/installed.txt"
-  "$PSQL" "$RESTORE_DATABASE_URL" --no-psqlrc --tuples-only --no-align --command "SELECT pubname FROM pg_publication" >"$WORKDIR/publications.txt"
-  "$PSQL" "$RESTORE_DATABASE_URL" --no-psqlrc --tuples-only --no-align --command "SELECT evtname FROM pg_event_trigger" >"$WORKDIR/event_triggers.txt"
+  restore_db_psql --no-psqlrc --tuples-only --no-align --command "SELECT name FROM pg_available_extensions" >"$WORKDIR/extensions.txt"
+  restore_db_psql --no-psqlrc --tuples-only --no-align --command "SELECT nspname FROM pg_namespace" >"$WORKDIR/schemas.txt"
+  restore_db_psql --no-psqlrc --tuples-only --no-align --command "SELECT extname FROM pg_extension" >"$WORKDIR/installed.txt"
+  restore_db_psql --no-psqlrc --tuples-only --no-align --command "SELECT pubname FROM pg_publication" >"$WORKDIR/publications.txt"
+  restore_db_psql --no-psqlrc --tuples-only --no-align --command "SELECT evtname FROM pg_event_trigger" >"$WORKDIR/event_triggers.txt"
   node "$ROOT/scripts/restore-list.mjs" filter "$WORKDIR/restore.toc" "$WORKDIR/extensions.txt" "$WORKDIR/restore.list" "$WORKDIR/restore.skip.json" "$WORKDIR/schemas.txt" "$WORKDIR/installed.txt" "$WORKDIR/publications.txt" "$WORKDIR/event_triggers.txt"
   set +e
   "$PG_RESTORE" --dbname "$RESTORE_DATABASE_URL" --no-owner --no-acl -L "$WORKDIR/restore.list" "$WORKDIR/restore.backup" >"$WORKDIR/restore.out" 2>"$WORKDIR/restore.err"
   restore_status=$?
   set -e
-  node "$ROOT/scripts/restore-list.mjs" classify "$WORKDIR/restore.err" "$WORKDIR/restore.skip.json" "$restore_status"
+  # Each check below used to fail the test as "Lifeboat failed with status 1". Its message stays in this log, and the
+  # check-in gets a fixed sentence picked from it by restore_failure_reason.
+  run_step node "$ROOT/scripts/restore-list.mjs" classify "$WORKDIR/restore.err" "$WORKDIR/restore.skip.json" "$restore_status" ||
+    fail "$(restore_failure_reason load "$STEP_ERR")"
   LIFEBOAT_PSQL="$PSQL" LIFEBOAT_PG_RESTORE="$PG_RESTORE" \
-    node "$ROOT/scripts/restore-list.mjs" sample "$WORKDIR/restore.toc" "$WORKDIR/restore.skip.json" "$WORKDIR/restore.backup"
+    run_step node "$ROOT/scripts/restore-list.mjs" sample "$WORKDIR/restore.toc" "$WORKDIR/restore.skip.json" "$WORKDIR/restore.backup" ||
+    fail "$(restore_failure_reason sample "$STEP_ERR")"
   # The users must come back too: the same accounts, password hashes and sign-in identities as the dump.
   LIFEBOAT_PSQL="$PSQL" LIFEBOAT_PG_RESTORE="$PG_RESTORE" LIFEBOAT_AUTH_COUNTS_FILE="$WORKDIR/auth.counts" \
-    node "$ROOT/scripts/restore-list.mjs" auth-verify "$WORKDIR/restore.toc" "$WORKDIR/restore.backup"
+    run_step node "$ROOT/scripts/restore-list.mjs" auth-verify "$WORKDIR/restore.toc" "$WORKDIR/restore.backup" ||
+    fail "$(restore_failure_reason users "$STEP_ERR")"
   if [[ -s "$WORKDIR/auth.counts" && "$(cat "$WORKDIR/auth.counts")" != none ]]; then
     read -r AUTH_USERS AUTH_PASSWORDS AUTH_IDENTITIES <"$WORKDIR/auth.counts"
   fi
@@ -1630,14 +1842,17 @@ elif [[ "$MODE" == "restore-test" ]]; then
   # table the list loads that is not there afterwards, are counted in the dump, so a pass says what it did not check.
   # Extension names from the action's own list (or "other") and counts only.
   LIFEBOAT_PSQL="$PSQL" LIFEBOAT_PG_RESTORE="$PG_RESTORE" \
-    node "$ROOT/scripts/restore-list.mjs" skipped-count "$WORKDIR/restore.toc" "$WORKDIR/restore.skip.json" "$WORKDIR/restore.backup" "$WORKDIR/skipped.counts" "$WORKDIR/restore.list"
+    node "$ROOT/scripts/restore-list.mjs" skipped-count "$WORKDIR/restore.toc" "$WORKDIR/restore.skip.json" "$WORKDIR/restore.backup" "$WORKDIR/skipped.counts" "$WORKDIR/restore.list" ||
+    fail "The database copy was restored and passed its checks, but the test restore could not count the tables it did not check. Its message is in this run's log in GitHub Actions."
   RESTORE_NOT_CHECKED="$(paste -sd ';' "$WORKDIR/skipped.counts")"
   rm -f "$WORKDIR/skipped.counts"
+  # The size goes in the check-in only once the restore and its checks have passed: a test that failed reports none.
+  DUMP_BYTES="$dump_bytes"
   rm -f "$WORKDIR/restore.backup"
   restore_code
   restore_setup
   restore_storage
-  "$PSQL" "$RESTORE_DATABASE_URL" --set ON_ERROR_STOP=1 --command "SELECT current_database();"
+  restore_db_psql --set ON_ERROR_STOP=1 --command "SELECT current_database();"
 else
   fail "LIFEBOAT_MODE must be backup or restore-test."
 fi

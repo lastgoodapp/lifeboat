@@ -139,6 +139,7 @@ runs:
   using: composite
   steps:
     - name: Install the Postgres client
+      id: postgres
       shell: bash
       env:
         POSTGRES_MAJOR: ${{ inputs.postgres-major }}
@@ -171,6 +172,7 @@ runs:
         fi
         echo "$bin" >> "$GITHUB_PATH"
     - name: Install age
+      id: age
       shell: bash
       run: |
         # age encrypts each copy to the app's public key and refuses to open a copy that was changed.
@@ -194,6 +196,7 @@ runs:
         rm -rf "$check"
         echo "age $(age --version) is ready."
     - name: Run Lifeboat
+      id: run
       shell: bash
       # LIFEBOAT_RESTORE_CONTAINER and LIFEBOAT_RESTORE_POSTGIS_IMAGE reach run.sh from the job environment
       # when the workflow wrote them to $GITHUB_ENV. They let restore-test swap in PostGIS. See README.md.
@@ -232,4 +235,19 @@ runs:
         VERCEL_PROJECT_ID: ${{ inputs.vercel-project-id }}
         VERCEL_TEAM_ID: ${{ inputs.vercel-team-id }}
       # exec: run.sh is the step's process, so a cancel or time out signals it, and it reports the run as stopped.
+      run: exec bash "$GITHUB_ACTION_PATH/scripts/run.sh"
+    - name: Check in a setup step that failed
+      # run.sh is what checks in, so a step above that failed, such as an install the runner could not finish, used to
+      # end the run before anything checked in: LastGood heard only from the 36-hour late check, and a test restore's
+      # failure only from the 35-day missed one. This runs run.sh again, only to check in as failed, naming that step.
+      # It does not run when run.sh itself failed: that already checked in.
+      if: failure() && steps.run.outcome != 'failure'
+      shell: bash
+      env:
+        LIFEBOAT_SETUP_FAILED: ${{ steps.postgres.outcome == 'failure' && 'postgres' || steps.age.outcome == 'failure' && 'age' || 'other' }}
+        LIFEBOAT_MODE: ${{ inputs.mode }}
+        LIFEBOAT_PROJECT: ${{ inputs.project }}
+        CHECKIN_URL: ${{ inputs.checkin-url }}
+        CHECKIN_SECRET: ${{ inputs.checkin-secret }}
+        RETENTION_DAYS: ${{ inputs.retention-days }}
       run: exec bash "$GITHUB_ACTION_PATH/scripts/run.sh"

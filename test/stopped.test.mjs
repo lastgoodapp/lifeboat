@@ -18,7 +18,7 @@ after(() => dirs.forEach((dir) => rmSync(dir, { recursive: true, force: true }))
  * (`to: "process"`) or its whole process group (`to: "group"`), and may follow the first signal with another while the
  * check-in is on its way (`during`). Names and secrets are made up.
  */
-async function stoppedBackup(signal, { to = "group", during } = {}) {
+async function stoppedBackup(signal, { to = "group", during, echoes = [], echoInCheckin = false, env = {} } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "lg-stopped-"));
   dirs.push(dir);
   // pg_dump writes its process group, so a run that never ends can be cleaned up, then hangs.
@@ -39,12 +39,22 @@ async function stoppedBackup(signal, { to = "group", during } = {}) {
         send(during);
         await new Promise((resolve) => setTimeout(resolve, 300));
       }
+      // The same SIGHUP again, to the run's own process group, while its check-in waits for the answer.
+      if (echoInCheckin) {
+        try {
+          process.kill(-dumpGroup, "SIGHUP");
+        } catch {
+          // Gone already.
+        }
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
       response.writeHead(200, { "content-type": "application/json" }).end("{}");
     });
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   let child;
   let dumpGroup;
+  let timers = [];
   const send = (sig) => process.kill(to === "group" ? -child.pid : child.pid, sig);
   try {
     child = spawn("bash", [RUN], {
@@ -65,21 +75,37 @@ async function stoppedBackup(signal, { to = "group", during } = {}) {
         CHECKIN_SECRET: "unit-test-checkin-secret",
         CHECKIN_URL: `http://127.0.0.1:${server.address().port}/checkin`,
         LIFEBOAT_WORKDIR: work,
+        ...env,
       },
     });
     const closed = new Promise((resolve) => child.on("close", (status, killedBy) => resolve({ status, killedBy })));
-    for (let waited = 0; !existsSync(started); waited += 20) {
-      assert.ok(waited < 20_000, "pg_dump never started");
-      await new Promise((resolve) => setTimeout(resolve, 20));
+    // Without a signal, the run ends on its own.
+    if (signal) {
+      for (let waited = 0; !existsSync(started); waited += 20) {
+        assert.ok(waited < 20_000, "pg_dump never started");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      dumpGroup = Number(readFileSync(started, "utf8"));
+      send(signal);
+      // What bash itself does when a SIGHUP ends a $(...) with a command still running in it: it sends SIGHUP again to
+      // its own process group, which is the run's, at no set time after the first.
+      timers = echoes.map((delay) =>
+        setTimeout(() => {
+          try {
+            process.kill(-dumpGroup, "SIGHUP");
+          } catch {
+            // Gone already.
+          }
+        }, delay),
+      );
     }
-    dumpGroup = Number(readFileSync(started, "utf8"));
-    send(signal);
     // Inside a runner's grace period: it sends SIGTERM 7.5 seconds after SIGINT, and kills what is left soon after.
     const late = new Promise((resolve) => setTimeout(() => resolve("late"), 7000));
     const ended = await Promise.race([closed, late]);
     assert.notEqual(ended, "late", "the run was still going 7 seconds after the signal");
     return { ...ended, bodies };
   } finally {
+    timers.forEach(clearTimeout);
     server.close();
     for (const group of [child?.pid, dumpGroup]) {
       try {
@@ -113,6 +139,27 @@ for (const to of ["group", "process"]) {
     assert.equal(exit, 130);
   });
 }
+
+test("the SIGHUP bash sends the run's process group again, as when one ends a $(...), doesn't stop the check-in", async () => {
+  const { status: exit, bodies } = await stoppedBackup("SIGHUP", { to: "process", echoes: [0, 10, 30, 60, 100, 150, 250] });
+  assert.equal(bodies.length, 1);
+  assert.equal(bodies[0].error, "Lifeboat was stopped (SIGHUP) before it finished, so this run proves nothing.");
+  assert.equal(exit, 129);
+});
+
+test("that SIGHUP again while the check-in waits for its answer doesn't stop the check-in either", async () => {
+  const { status: exit, bodies } = await stoppedBackup("SIGHUP", { to: "process", echoInCheckin: true });
+  assert.equal(bodies.length, 1);
+  assert.equal(bodies[0].error, "Lifeboat was stopped (SIGHUP) before it finished, so this run proves nothing.");
+  assert.equal(exit, 129);
+});
+
+test("a signal during the check-in of a run that had already failed doesn't change what it checks in", async () => {
+  const { status: exit, bodies } = await stoppedBackup(null, { to: "process", during: "SIGTERM", env: { DATABASE_URL: "" } });
+  assert.equal(bodies.length, 1);
+  assert.match(bodies[0].error, /^Set DATABASE_URL\./);
+  assert.equal(exit, 1);
+});
 
 test("the action runs run.sh as the step's own process, so a cancel or time out signals it", () => {
   const action = readFileSync(path.join(ROOT, "action.yml"), "utf8");

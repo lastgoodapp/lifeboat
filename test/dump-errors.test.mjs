@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -97,10 +97,19 @@ const CASES = [
   [`pg_dump: error: ${HOST} Connection timed out`, /^pg_dump could not reach the database: it didn't answer\./],
   [`pg_dump: error: ${HOST} Connection refused`, /^pg_dump could not reach the database: it didn't answer\./],
   ['pg_dump: error: query failed: ERROR:  canceling statement due to lock timeout', /^pg_dump stopped: a table stayed locked for 10 minutes/],
+  // A backup login without BYPASSRLS: pg_dump turns row security off, so Postgres refuses the table instead of hiding rows.
+  ['pg_dump: error: query failed: ERROR:  query would be affected by row-level security policy for table "invoices"', /^pg_dump stopped at a table with row level security: the backup login can't bypass it in this project/],
   ['pg_dump: error: query failed: ERROR:  permission denied for table invoices', /^pg_dump was refused read access to part of the database\./],
   ['pg_dump: error: could not write to output file: No space left on device', /^pg_dump stopped: the runner ran out of disk while writing the dump\.$/],
   ["pg_dump: error: something new", /^pg_dump could not read the database\. Its message is in this run's log in GitHub Actions\.$/],
 ];
+
+/** A work folder where `name`, the file a step's message once went through, keeps nothing written to it, as on a full disk. */
+function lossyWorkdir(name) {
+  const work = mkdtempSync(path.join(tmpdir(), "lg-lossy-"));
+  symlinkSync("/dev/null", path.join(work, name));
+  return work;
+}
 
 test("a failed pg_dump checks in with a sentence that says why, and its own message stays in the log", async () => {
   for (const [message, reason] of CASES) {
@@ -117,6 +126,14 @@ test("a failed pg_dump checks in with a sentence that says why, and its own mess
     assert.doesNotMatch(checkin.error, /pooler\.supabase\.com|lastgood_backup|invoices|13\.236/);
     assert.ok(run.stderr.includes(message), "pg_dump's own message is in the run's log");
   }
+});
+
+test("pg_dump's message picks the check-in's sentence and reaches the log even when the work folder keeps nothing", async () => {
+  const message = "pg_dump: error: could not write to output file: No space left on device";
+  const run = await backup(message, { env: { LIFEBOAT_WORKDIR: lossyWorkdir("pg_dump.err") } });
+  assert.equal(run.status, 1);
+  assert.equal(JSON.parse(run.bodies[0]).error, "pg_dump stopped: the runner ran out of disk while writing the dump.");
+  assert.ok(run.stderr.includes(message), "pg_dump's own message is in the run's log");
 });
 
 test("a DATABASE_URL that pg_dump echoes back never reaches the check-in", async () => {

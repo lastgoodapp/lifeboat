@@ -35,6 +35,11 @@ const body = JSON.stringify({
   githubIssues: optionalNumberEnv("LIFEBOAT_GITHUB_ISSUES"),
   githubPullRequests: optionalNumberEnv("LIFEBOAT_GITHUB_PULLS"),
   githubComments: optionalNumberEnv("LIFEBOAT_GITHUB_COMMENTS"),
+  // Whether the code copy's default branch keeps files in Git LFS (B3). Null when the run made no code copy.
+  codeLfs: process.env.LIFEBOAT_CODE_LFS === "true" ? true : process.env.LIFEBOAT_CODE_LFS === "false" ? false : null,
+  // How many submodules the code copy's default branch points at (B3): the copy holds the commit each one points at,
+  // not its files. A backup's only; null in a restore test, or when the run made no code copy or could not count them.
+  codeSubmodules: kind === "backup" ? countEnv("LIFEBOAT_CODE_SUBMODULES") : null,
   // Null when the database has no Supabase Auth users.
   authUsers: optionalNumberEnv("LIFEBOAT_AUTH_USERS"),
   authUsersWithPassword: optionalNumberEnv("LIFEBOAT_AUTH_PASSWORDS"),
@@ -43,6 +48,10 @@ const body = JSON.stringify({
   setupFunctions: optionalNumberEnv("LIFEBOAT_SETUP_FUNCTIONS"),
   setupCronJobs: optionalNumberEnv("LIFEBOAT_SETUP_CRON_JOBS"),
   setupBytes: optionalNumberEnv("LIFEBOAT_SETUP_BYTES"),
+  // How a backup copied the Supabase setup: "token" (the customer's own LIFEBOAT_SUPABASE_TOKEN) or "none" (no token, so
+  // no setup copy at all), so a status page and the alert emails can say so. Null in a restore test, or when the token
+  // is set but encryption is off.
+  setupSource: kind === "backup" && ["token", "none"].includes(process.env.LIFEBOAT_SETUP_SOURCE) ? process.env.LIFEBOAT_SETUP_SOURCE : null,
   // Null when the run made no Vercel copy, such as when LIFEBOAT_VERCEL_TOKEN is not set. Counts only, never names.
   vercelEnvVars: optionalNumberEnv("LIFEBOAT_VERCEL_ENV_VARS"),
   vercelEnvValues: optionalNumberEnv("LIFEBOAT_VERCEL_ENV_VALUES"),
@@ -65,6 +74,10 @@ const body = JSON.stringify({
   // Each copy a test restore downloaded, with the SHA-256 of the bytes it downloaded, so LastGood can check them against
   // the records it kept when a backup uploaded them (D18). A backup sends an empty list.
   opened: kind === "restore-test" ? openedFile(process.env.LIFEBOAT_OPENED_FILE) : [],
+  // What a backup's monthly copy came to (B14): off, made, already or none. Null in a restore test, or a night cut short.
+  monthlyState: kind === "backup" && ["off", "made", "already", "none"].includes(process.env.LIFEBOAT_MONTHLY_STATE) ? process.env.LIFEBOAT_MONTHLY_STATE : null,
+  // Why a backup made none: no-monthly-bucket, when the bucket's own rule keeps copies and no monthly bucket is set.
+  monthlyReason: kind === "backup" && process.env.LIFEBOAT_MONTHLY_STATE === "none" && ["no-monthly-bucket"].includes(process.env.LIFEBOAT_MONTHLY_REASON) ? process.env.LIFEBOAT_MONTHLY_REASON : null,
   error: process.env.LIFEBOAT_ERROR ? process.env.LIFEBOAT_ERROR.slice(0, 300) : null,
 });
 
@@ -88,6 +101,14 @@ function optionalNumberEnv(name) {
   if (raw === "") return null;
   const value = Number(raw);
   return Number.isFinite(value) ? value : null;
+}
+
+/** A count run.sh made: a whole number from 0, or null when it is missing or not one. */
+function countEnv(name) {
+  const raw = (process.env[name] ?? "").trim();
+  if (!/^(0|[1-9]\d{0,15})$/.test(raw)) return null;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) ? value : null;
 }
 
 /** A run ID or attempt as GitHub sets it: a whole number from 1, or null when it is missing or not one. */

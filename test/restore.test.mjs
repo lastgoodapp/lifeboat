@@ -43,12 +43,14 @@ const PLAIN_SQL = `CREATE TABLE public.places (
  * Fakes for docker, psql, pg_restore and aws. The fake database offers PostGIS only after
  * docker starts a postgis/ image, and pg_restore fails the way FlipPro did when it does not.
  */
-function fakes(dir, { toc, sql, target, dockerRun, dumpKey, download, authCopy = {}, authRestored = {}, codeKey = "", codeArchive = "", setupKey = "", setupArchive = "", storageKeys = [], storageArchive = "", dumpRows = {}, missing = [], deadProbes = 0 }) {
+function fakes(dir, { toc, sql, target, dockerRun, dumpKey, download, authCopy = {}, authRestored = {}, codeKey = "", codeArchive = "", setupKey = "", setupArchive = "", storageKeys = [], storageArchive = "", dumpRows = {}, missing = [], deadProbes = 0, restoreError = "", restoreStatus = 1, downOn = "" }) {
   const bin = path.join(dir, "bin");
   mkdirSync(bin);
   writeFileSync(path.join(dir, "dump.toc"), toc);
   writeFileSync(path.join(dir, "dump.schema.sql"), sql);
   writeFileSync(path.join(dir, "target"), target);
+  // What pg_restore prints when the restore itself fails, as it does when the throwaway database runs out of room.
+  writeFileSync(path.join(dir, "restore.error"), restoreError);
   for (const name of ["docker.log", "psql.log", "restore.log", "aws.log"]) writeFileSync(path.join(dir, name), "");
   // Supabase Auth rows in the dump, as pg_restore -a prints them, and the counts the restored database answers.
   for (const [table, copy] of Object.entries(authCopy)) writeFileSync(path.join(dir, `copy.auth.${table}`), copy);
@@ -88,7 +90,9 @@ for arg in "$@"; do
   prev="$arg"
 done
 case "$sql" in
-  "SHOW server_version_num") echo 170006 ;;
+${downOn ? `  # The throwaway database stops answering at this query, as one that has crashed or been stopped does.
+  ${downOn}) echo 'psql: error: connection to server at "localhost" (127.0.0.1), port 5432 failed: server closed the connection unexpectedly' >&2; exit 2 ;;
+` : ""}  "SHOW server_version_num") echo 170006 ;;
   # The first deadProbes "SELECT 1" answers are refused, as from a database that has not started (or never does).
   "SELECT 1")
     probes=$(cat "${dir}/probes" 2>/dev/null || echo 0)
@@ -132,6 +136,7 @@ case "$1" in
     exit 1 ;;
   --dbname)
     printf '%s\\n' "$2" >> "${dir}/restore.log"
+    if [ -s "${dir}/restore.error" ]; then cat "${dir}/restore.error" >&2; exit ${restoreStatus}; fi
     if grep -q "EXTENSION - postgis" "${dir}/dump.toc" && [ "$(cat "${dir}/target")" != postgis ]; then
       echo 'pg_restore: error: could not execute query: ERROR:  type "extensions.geometry" does not exist' >&2
       exit 1
@@ -200,9 +205,18 @@ function runRestoreTest({
   dumpRows = {},
   missing = [],
   deadProbes = 0,
+  restoreError = "",
+  restoreStatus = 1,
+  downOn = "",
+  tools = {},
 } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "lg-restore-test-"));
-  const bin = fakes(dir, { toc, sql, target, dockerRun, dumpKey, download, authCopy, authRestored, codeKey, codeArchive, setupKey, setupArchive, storageKeys, storageArchive, dumpRows, missing, deadProbes });
+  const bin = fakes(dir, { toc, sql, target, dockerRun, dumpKey, download, authCopy, authRestored, codeKey, codeArchive, setupKey, setupArchive, storageKeys, storageArchive, dumpRows, missing, deadProbes, restoreError, restoreStatus, downOn });
+  // Any other tool a test stands in for, such as git, goes first on the PATH beside the fakes.
+  for (const [name, body] of Object.entries(tools)) {
+    writeFileSync(path.join(bin, name), body);
+    chmodSync(path.join(bin, name), 0o755);
+  }
   const work = path.join(dir, "work");
   const runner = path.join(dir, "runner");
   mkdirSync(work);
@@ -278,6 +292,24 @@ test("without a container to replace, a PostGIS dump fails before restoring and 
   assert.equal(restores, "");
 });
 
+test("a PostGIS stop checks in the plan's short form, and the log keeps the whole message", async () => {
+  const catcher = await checkinCatcher();
+  try {
+    const { result, restores } = runRestoreTest({ env: catcher.env });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /The dump uses PostGIS \(extension postgis; type extensions\.geometry\), and the restore database does not offer postgis\. PostGIS is not a Supabase-only extension/);
+    assert.equal(restores, "");
+    const [body] = catcher.bodies();
+    assert.equal(body.ok, false);
+    assert.equal(
+      body.error,
+      "The dump uses PostGIS, which the restore database does not offer. Lifeboat was not given a throwaway container to replace (LIFEBOAT_RESTORE_CONTAINER). Start the restore database from postgis/postgis:17-3.5. The restore test stopped before restoring.",
+    );
+  } finally {
+    catcher.stop();
+  }
+});
+
 test("a PostGIS image that does not start fails the restore test and names PostGIS", () => {
   const { result, restores } = runRestoreTest({ env: CONTAINER, dockerRun: "fail" });
   assert.notEqual(result.status, 0);
@@ -294,6 +326,31 @@ test("a throwaway database that never answers fails the restore test before anyt
   assert.equal(aws, "");
   assert.equal(restores, "");
   assert.equal(psql.trim().split("\n").length, 2);
+});
+
+test("a database listing the bucket refuses fails the test restore as unlisted, not as no copy", () => {
+  const refused = `#!/bin/sh
+printf '%s\\n' "$*" >> "$(dirname "$0")/../aws.log"
+echo "An error occurred (AccessDenied) when calling the ListObjectsV2 operation: Access Denied" >&2
+exit 254
+`;
+  const { result, restores } = runRestoreTest({ toc: PLAIN_TOC, sql: PLAIN_SQL, tools: { aws: refused } });
+  assert.notEqual(result.status, 0);
+  assert.match(
+    result.stderr,
+    /The database copies under lifeboat\/db\/ could not be listed, so nothing was restored\. Its message is in this run's log in GitHub Actions\./,
+  );
+  assert.match(result.stderr, /AccessDenied/);
+  assert.doesNotMatch(result.stderr, /No \.backup object was found/);
+  assert.equal(restores, "");
+});
+
+test("a database folder with no copy in it still says no .backup object was found", () => {
+  const { result, restores } = runRestoreTest({ toc: PLAIN_TOC, sql: PLAIN_SQL, dumpKey: "" });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /No \.backup object was found under lifeboat\/db\/\./);
+  assert.doesNotMatch(result.stderr, /could not be listed/);
+  assert.equal(restores, "");
 });
 
 test("a throwaway database that answers on its second try is restored as usual", () => {
@@ -526,7 +583,8 @@ function git(cwd, ...args) {
 
 /**
  * A code copy as the backup makes it: code.bundle and github/*.json in one tar.gz, encrypted with age when a
- * public key is given. `damage` changes the bundle's bytes before it is packed; `empty` leaves the bundle out.
+ * public key is given. `damage` changes the bundle's bytes before it is packed; `empty` leaves the bundle out;
+ * `submodules` puts that many submodules on the default branch, as gitlinks to commits the copy never holds.
  */
 /**
  * tar arguments that add a name outside the folder an archive opens into, as only a hand-made archive could hold:
@@ -539,7 +597,7 @@ function outsideNames(dir, outside) {
   return ["-P", outside === "absolute" ? evil : "../evil.txt"];
 }
 
-function codeCopy({ publicKey = "", damage = null, empty = false, outside = "", link = false } = {}) {
+function codeCopy({ publicKey = "", damage = null, empty = false, outside = "", link = false, submodules = 0 } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "lg-code-copy-"));
   const pack = path.join(dir, "pack");
   mkdirSync(path.join(pack, "github"), { recursive: true });
@@ -556,6 +614,10 @@ function codeCopy({ publicKey = "", damage = null, empty = false, outside = "", 
     git(repo, "add", "agent.txt");
     git(repo, "commit", "-q", "-m", "agent work");
     git(repo, "checkout", "-q", "main");
+    for (let index = 1; index <= submodules; index += 1) {
+      git(repo, "update-index", "--add", "--cacheinfo", `160000,${String(index).repeat(40)},libs/lib${index}`);
+    }
+    if (submodules > 0) git(repo, "commit", "-q", "-m", "submodules");
     git(repo, "bundle", "create", "-q", path.join(pack, "code.bundle"), "--all");
     if (damage) writeFileSync(path.join(pack, "code.bundle"), damage(readFileSync(path.join(pack, "code.bundle"))));
   }
@@ -868,6 +930,204 @@ server.listen(0, "127.0.0.1", () => console.log(server.address().port));`,
   };
 }
 
+test("a test restore whose database did not restore, or did not match the dump, checks in with no database size", async () => {
+  const catcher = await checkinCatcher();
+  try {
+    const failed = runRestoreTest({ toc: PLAIN_TOC, sql: PLAIN_SQL, restoreError: "pg_restore: error: could not execute query: ERROR:  could not extend file: No space left on device\n", env: catcher.env });
+    assert.notEqual(failed.result.status, 0);
+    assert.match(failed.result.stderr, /Restore failed: pg_restore: error: could not execute query/);
+    const differ = runRestoreTest({ toc: PLAIN_TOC, sql: PLAIN_SQL, dumpRows: { "public.places": "COPY public.places (id) FROM stdin;\n1\n2\n3\n\\.\n" }, env: catcher.env });
+    assert.notEqual(differ.result.status, 0);
+    assert.match(differ.result.stderr, /Row count mismatch for public\.places: restored 2, dump 3\./);
+    // A PostGIS dump with no container to replace stops before pg_restore runs at all.
+    const stopped = runRestoreTest({ env: catcher.env });
+    assert.notEqual(stopped.result.status, 0);
+    assert.match(stopped.result.stderr, /stopped before restoring/);
+    const passed = runRestoreTest({ toc: PLAIN_TOC, sql: PLAIN_SQL, env: catcher.env });
+    assert.equal(passed.result.status, 0, passed.result.stderr);
+    const [restoreFailed, rowsDiffer, neverRestored, pass] = catcher.bodies();
+    assert.deepEqual([restoreFailed.ok, restoreFailed.dumpBytes], [false, 0], "pg_restore failed");
+    assert.deepEqual([rowsDiffer.ok, rowsDiffer.dumpBytes], [false, 0], "a row count did not match");
+    assert.deepEqual([neverRestored.ok, neverRestored.dumpBytes], [false, 0], "stopped before restoring");
+    assert.deepEqual([pass.ok, pass.dumpBytes], [true, 4], "a restore that passed its checks reports the copy's size");
+  } finally {
+    catcher.stop();
+  }
+});
+
+test("a test restore whose code copy fails its sample read checks in with no code counts, and the database before it keeps its size", async () => {
+  const realGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+  // Every ref clones back and fsck passes, but the file on the default branch does not read back.
+  const gitReadsNoFile = `#!/bin/sh
+case " $* " in
+  *" cat-file "*) exit 128 ;;
+esac
+exec "${realGit}" "$@"
+`;
+  const catcher = await checkinCatcher();
+  try {
+    const { result } = runRestoreTest({ toc: PLAIN_TOC, sql: PLAIN_SQL, codeKey: CODE_KEY, codeArchive: codeCopy(), tools: { git: gitReadsNoFile }, env: catcher.env });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /A file on the default branch did not read back from the code copy 20261018T000000Z\.tar\.gz\. The code copy did not restore\./);
+    const [body] = catcher.bodies();
+    assert.equal(body.ok, false);
+    for (const field of ["codeBranches", "codeTags", "githubIssues", "githubPullRequests", "githubComments"]) {
+      assert.equal(body[field], null, `${field}: no counts for a code copy that did not read back`);
+    }
+    assert.equal(body.dumpBytes, 4, "the database restored and passed its checks first, so it keeps its size");
+  } finally {
+    catcher.stop();
+  }
+});
+
+/** The check-in carries the step's fixed sentence, never the tool's own words, and the tool's message stays in the log. */
+function assertReason(label, run, checkin, { error, message, words }) {
+  assert.notEqual(run.result.status, 0, label);
+  assert.equal(checkin.ok, false, label);
+  assert.equal(checkin.error, error, label);
+  // The check-in keeps 300 characters, so the whole sentence must fit.
+  assert.ok(checkin.error.length <= 300, `${label}: ${checkin.error.length}`);
+  assert.doesNotMatch(checkin.error, /failed with status/, label);
+  assert.doesNotMatch(checkin.error, words, `${label}: none of the tool's own words`);
+  assert.ok(run.result.stderr.includes(message), `${label}: the tool's own message is in the run's log`);
+}
+
+/** A download that is not a database copy at all, as a damaged copy is to pg_restore. */
+function notADump() {
+  const file = path.join(mkdtempSync(path.join(tmpdir(), "lg-not-a-dump-")), "copy.backup");
+  writeFileSync(file, "not a dump");
+  return file;
+}
+
+const STOPPED_ANSWERING = "server closed the connection unexpectedly";
+const DB_STOPPED = "The throwaway database for the test restore stopped answering part way through, so the test restore did not finish. The next test restore tries again.";
+const LOAD_FAILED = "pg_restore could not load the database copy into the throwaway database. Its message is in this run's log in GitHub Actions.";
+
+// Each step of a test restore that used to check in as "Lifeboat failed with status N", made to fail as a real one does.
+const RESTORE_FAILURES = [
+  {
+    label: "a passphrase copy that does not open",
+    options: {
+      dumpKey: "lifeboat/db/20261016T000000Z.backup.enc",
+      env: { LIFEBOAT_ENCRYPT: "true", LIFEBOAT_ENCRYPTION_PASSPHRASE: "not-the-passphrase-it-was-made-with" },
+      tools: {
+        openssl: `#!/bin/sh
+echo "bad decrypt" >&2
+echo "40B7C1F2DC7F0000:error:1C800064:Provider routines:ossl_cipher_unpadblock:bad decrypt:../providers/implementations/ciphers/ciphercommon.c:124:" >&2
+exit 1
+`,
+      },
+    },
+    error: "This copy did not open with LIFEBOAT_ENCRYPTION_PASSPHRASE. Either it was made with another passphrase, or it was changed or damaged after it was made. It was not restored.",
+    message: "ossl_cipher_unpadblock:bad decrypt",
+    words: /bad decrypt|ciphercommon|not-the-passphrase|20261016T000000Z/,
+  },
+  {
+    label: "a database copy pg_restore cannot read",
+    options: { download: notADump() },
+    error: "pg_restore could not read the database copy, so nothing was restored. The copy may be damaged, or made by a newer pg_dump than this runner's pg_restore. Its message is in this run's log in GitHub Actions.",
+    message: "pg_restore: error: input file does not appear to be a valid archive",
+    words: /valid archive|input file|restore\.backup/,
+  },
+  {
+    label: "a throwaway database that stops answering before the restore",
+    options: { downOn: '"SELECT pubname FROM pg_publication"' },
+    error: DB_STOPPED,
+    message: STOPPED_ANSWERING,
+    words: /localhost|127\.0\.0\.1|5432|pg_publication/,
+  },
+  {
+    label: "a throwaway database that stops answering at the end",
+    options: { downOn: '"SELECT current_database();"' },
+    error: DB_STOPPED,
+    message: STOPPED_ANSWERING,
+    words: /localhost|127\.0\.0\.1|5432|current_database/,
+  },
+  {
+    label: "pg_restore on a full disk",
+    options: {
+      restoreError: 'pg_restore: error: could not execute query: ERROR:  could not extend file "base/16384/16385": No space left on device\nHINT:  Check free disk space.\nCommand was: COPY public.places (id) FROM stdin;\n',
+    },
+    error: "The runner ran out of disk while the database copy was loaded into the throwaway database.",
+    message: 'could not extend file "base/16384/16385": No space left on device',
+    words: /places|base\/16384|COPY|HINT/,
+  },
+  {
+    label: "pg_restore out of Docker's shared memory, which is not disk",
+    options: {
+      restoreError: 'pg_restore: error: could not execute query: ERROR:  could not resize shared memory segment "/PostgreSQL.2931" to 8388608 bytes: No space left on device\nCommand was: CREATE INDEX places_id_idx ON public.places USING btree (id);\n',
+    },
+    error: LOAD_FAILED,
+    message: 'could not resize shared memory segment "/PostgreSQL.2931"',
+    words: /places|PostgreSQL\.2931|disk/,
+  },
+  {
+    label: "pg_restore stopped by the out-of-memory killer",
+    options: { restoreError: 'pg_restore: creating INDEX "public.places_id_idx"\n', restoreStatus: 137 },
+    error: "pg_restore was stopped before the database copy finished loading, most likely because the runner ran out of memory.",
+    message: "Restore failed: pg_restore was stopped by signal 9 before it finished.",
+    words: /places|signal 9|137/,
+  },
+  {
+    label: "pg_restore failing any other way",
+    options: {
+      restoreError: 'pg_restore: error: could not execute query: ERROR:  duplicate key value violates unique constraint "places_pkey"\nDETAIL:  Key (id)=(42) already exists.\nCommand was: COPY public.places (id) FROM stdin;\n',
+    },
+    error: LOAD_FAILED,
+    message: 'duplicate key value violates unique constraint "places_pkey"',
+    words: /places|Key \(id\)|42|duplicate/,
+  },
+  {
+    label: "a table whose rows did not all come back",
+    options: { dumpRows: { "public.places": "COPY public.places (id) FROM stdin;\n1\n2\n3\n\\.\n" } },
+    error: "A table in the throwaway database came back with a different number of rows than the database copy holds. The table is named in this run's log in GitHub Actions.",
+    message: "Row count mismatch for public.places: restored 2, dump 3.",
+    words: /places|restored 2|dump 3/,
+  },
+  {
+    label: "row counts the throwaway database stopped answering for",
+    options: { downOn: "*pg_total_relation_size*" },
+    error: "The database copy was restored, but its row counts could not be compared. Its message is in this run's log in GitHub Actions.",
+    message: STOPPED_ANSWERING,
+    words: /localhost|127\.0\.0\.1|places/,
+  },
+  {
+    label: "users that did not all come back",
+    options: { toc: AUTH_TOC, authCopy: AUTH_COPY, authRestored: { users: 3, withPassword: 1, identities: 3 } },
+    error: "The users did not all come back: the throwaway database has a different number of accounts, passwords or sign-in identities than the database copy. The counts are in this run's log in GitHub Actions.",
+    message: "Users did not come back: the dump has 2 accounts with a password, the test restore has 1.",
+    words: /example\.invalid|\$2a\$|has 1|has 2|auth\./,
+  },
+  {
+    label: "users the throwaway database stopped answering for",
+    options: { toc: AUTH_TOC, authCopy: AUTH_COPY, authRestored: { users: 3, withPassword: 2, identities: 3 }, downOn: '*"auth.users WHERE email IS DISTINCT FROM"*' },
+    error: "The database copy was restored, but its users could not be checked. Its message is in this run's log in GitHub Actions.",
+    message: STOPPED_ANSWERING,
+    words: /localhost|127\.0\.0\.1|example\.invalid|auth\./,
+  },
+  {
+    label: "the tables left unchecked, which the throwaway database stopped answering for",
+    options: { downOn: "*to_regclass*" },
+    error: "The database copy was restored and passed its checks, but the test restore could not count the tables it did not check. Its message is in this run's log in GitHub Actions.",
+    message: STOPPED_ANSWERING,
+    words: /localhost|127\.0\.0\.1|places/,
+  },
+];
+
+test("a test restore step that fails checks in with a sentence that says why, and the tool's own message stays in the log", async () => {
+  const catcher = await checkinCatcher();
+  try {
+    const runs = RESTORE_FAILURES.map(({ options }) =>
+      runRestoreTest({ toc: PLAIN_TOC, sql: PLAIN_SQL, ...options, env: { ...options.env, ...catcher.env } }),
+    );
+    const bodies = catcher.bodies();
+    assert.equal(bodies.length, RESTORE_FAILURES.length, "each run checked in once");
+    RESTORE_FAILURES.forEach((failure, index) => assertReason(failure.label, runs[index], bodies[index], failure));
+  } finally {
+    catcher.stop();
+  }
+});
+
 /** A copy's name for a time this many hours ago, as the workflow names one: 20261029T161700Z. */
 function stampHoursAgo(hours) {
   return new Date(Date.now() - hours * 60 * 60 * 1000).toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
@@ -914,11 +1174,27 @@ test("the test restore checks in with the time of the copy it opened, pass or fa
     const [pass, fail, unnamed] = catcher.bodies();
     const at = `${stamp.slice(0, 4)}-${stamp.slice(4, 6)}-${stamp.slice(6, 8)}T${stamp.slice(9, 11)}:${stamp.slice(11, 13)}:${stamp.slice(13, 15)}Z`;
     assert.deepEqual([pass.kind, pass.ok, pass.restoredCopyAt], ["restore-test", true, at]);
+    // A test restore makes no Supabase setup copy, so it names no source for one.
+    assert.equal(pass.setupSource, null);
     assert.deepEqual([fail.ok, fail.restoredCopyAt], [false, at]);
     assert.equal(unnamed.restoredCopyAt, null);
     // The failure's own error text names the copy, as it always has, and so does the list of copies opened; the time
     // field never does.
     assert.doesNotMatch(JSON.stringify([pass.restoredCopyAt, unnamed.restoredCopyAt]), /\.backup|handmade/);
+  } finally {
+    catcher.stop();
+  }
+});
+
+test("the test restore sends no monthly state, even with monthly copies on and nowhere to keep them", async () => {
+  const catcher = await checkinCatcher();
+  try {
+    const env = { ...catcher.env, LIFEBOAT_MONTHLY_COPIES: "true", LIFEBOAT_MANAGE_RETENTION: "false" };
+    const { result } = runRestoreTest({ toc: PLAIN_TOC, sql: PLAIN_SQL, env });
+    assert.equal(result.status, 0, result.stderr);
+    const [body] = catcher.bodies();
+    assert.deepEqual([body.kind, body.ok, body.monthlyState, body.monthlyReason], ["restore-test", true, null, null]);
+    assert.doesNotMatch(result.stdout, /Monthly copies are on/);
   } finally {
     catcher.stop();
   }
@@ -942,6 +1218,20 @@ test("the test restore checks in with each copy it downloaded and the SHA-256 of
       { key: CODE_KEY, sha256: sha256(readFileSync(archive)) },
     ]);
     assert.deepEqual(fail.opened, [{ key: dumpKey, sha256: sha256("dump") }]);
+  } finally {
+    catcher.stop();
+  }
+});
+
+test("the test restore never counts submodules: its check-in sends no count, even from a code copy that has them", async () => {
+  const catcher = await checkinCatcher();
+  try {
+    const { result } = runRestoreTest({ toc: PLAIN_TOC, sql: PLAIN_SQL, codeKey: CODE_KEY, codeArchive: codeCopy({ submodules: 2 }), env: catcher.env });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Code: 2 branches and 1 tags cloned back out of 20261018T000000Z\.tar\.gz, and git fsck found no damage\./);
+    assert.doesNotMatch(result.stdout + result.stderr, /submodule/);
+    const [restore] = catcher.bodies();
+    assert.deepEqual([restore.kind, restore.ok, restore.codeBranches, restore.codeSubmodules], ["restore-test", true, 2, null]);
   } finally {
     catcher.stop();
   }

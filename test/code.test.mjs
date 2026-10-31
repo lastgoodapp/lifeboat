@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -73,6 +73,13 @@ const url = (list, extra = "") => {
   const spec = LISTS.find((item) => item.path === list);
   return `${BASE}/${list}?${new URLSearchParams({ ...spec.query, per_page: "100" })}${extra}`;
 };
+
+/** A work folder where `name`, the file a step's message once went through, keeps nothing written to it, as on a full disk. */
+function lossyWorkdir(name) {
+  const work = mkdtempSync(path.join(tmpdir(), "lg-lossy-"));
+  symlinkSync("/dev/null", path.join(work, name));
+  return work;
+}
 
 test("nextLink reads only the next page", () => {
   assert.equal(nextLink('<https://a/b?page=2>; rel="next", <https://a/b?page=5>; rel="last"'), "https://a/b?page=2");
@@ -371,10 +378,15 @@ const GOOD_API = {
   [`/repos/${REPO}/pulls/comments`]: { status: 200, body: [{ id: 11, body: "nit" }] },
 };
 
-async function backupWithCode(answers, extra = {}) {
+async function backupWithCode(answers, extra = {}, repository = sourceRepo, tools = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "lg-code-"));
-  sourceRepo(dir);
+  repository(dir);
   const uploads = fakeTools(dir);
+  // Any other tool a test stands in for, such as tar, goes first on the PATH beside the fakes.
+  for (const [name, body] of Object.entries(tools)) {
+    writeFileSync(path.join(dir, name), body);
+    chmodSync(path.join(dir, name), 0o755);
+  }
   const work = path.join(dir, "work");
   mkdirSync(work);
   const keyFile = path.join(dir, "key.txt");
@@ -450,6 +462,9 @@ test("backup uploads every branch and tag, with issues and pull requests, in one
   assert.equal(run.checkins[0].githubPullRequests, 1);
   assert.equal(run.checkins[0].githubComments, 2);
   assert.ok(run.checkins[0].codeBytes > 0);
+  assert.equal(run.checkins[0].codeLfs, false, "no .gitattributes, so no Git LFS");
+  assert.equal(run.checkins[0].codeSubmodules, 0, "no submodules, counted as none");
+  assert.doesNotMatch(run.stdout, /submodule/);
 });
 
 test("a workflow without issues: read fails the run by name, after the database copy, and uploads no code", async () => {
@@ -486,6 +501,16 @@ test("a clone that cannot reach GitHub says so, not that a permission is missing
   assert.equal(run.checkins[0].codeBranches, null);
 });
 
+test("git's message picks the check-in's sentence and reaches the log even when the work folder keeps nothing", async () => {
+  const run = await backupWithCode(GOOD_API, { GITHUB_SERVER_URL: "http://127.0.0.1:9", LIFEBOAT_WORKDIR: lossyWorkdir("git.err") });
+  assert.notEqual(run.status, 0);
+  assert.equal(
+    run.checkins[0].error,
+    "git could not reach GitHub to copy acme/notes, or GitHub didn't answer. The next run tries again. Nothing was uploaded for the code.",
+  );
+  assert.match(run.stderr, /Failed to connect/, "git's own message is in the run's log");
+});
+
 test("a token GitHub refuses when cloning over HTTP still names the permission", async () => {
   // The fake answers 401 to anything not sent with the bearer token, as GitHub does to a token without contents: read.
   const run = await backupWithCode(GOOD_API, (port) => ({ GITHUB_SERVER_URL: `http://127.0.0.1:${port}` }));
@@ -518,6 +543,245 @@ test("a users check failure still uploads the code archive, then fails the run",
   assert.equal(readdirSync(path.join(run.uploads, "lifeboat", "db")).length, 1, "the database copy still went up");
   assert.equal(run.checkins[0].ok, false);
   assert.equal(run.checkins[0].codeBranches, 3);
+});
+
+const LFS_ATTRIBUTES = "*.psd filter=lfs diff=lfs merge=lfs -text\n";
+const LFS_WARNING = "::warning::acme/notes keeps files in Git LFS. The code copy holds their pointers, not the files, so keep a copy of the LFS files yourself.";
+
+/** sourceRepo's repository with these files committed on main, its default branch. */
+function withFiles(files) {
+  return (root) => {
+    const dir = sourceRepo(root);
+    for (const [name, text] of Object.entries(files)) {
+      mkdirSync(path.dirname(path.join(dir, name)), { recursive: true });
+      writeFileSync(path.join(dir, name), text);
+      git(dir, "add", name);
+    }
+    git(dir, "commit", "-q", "-m", "attributes");
+    return dir;
+  };
+}
+
+test("a default branch whose .gitattributes sends files to Git LFS, at the top or in a folder, warns in the log and tells the check-in", async () => {
+  // No Git LFS install is needed: the attribute alone says the repository keeps files there.
+  for (const name of [".gitattributes", "assets/.gitattributes", "assets/art/.gitattributes"]) {
+    const run = await backupWithCode(GOOD_API, {}, withFiles({ [name]: LFS_ATTRIBUTES }));
+    assert.equal(run.status, 0, run.stderr);
+    const lines = run.stdout.split("\n");
+    const code = lines.findIndex((line) => line.startsWith("Code: 3 branches, 3 tags."));
+    assert.ok(code >= 0, run.stdout);
+    assert.equal(lines[code + 1], LFS_WARNING, name);
+    assert.equal(run.checkins[0].ok, true);
+    assert.equal(run.checkins[0].codeLfs, true, name);
+    assert.equal(run.checkins[0].codeBranches, 3);
+  }
+});
+
+test("Git LFS only on another branch, or filter=lfs outside a .gitattributes, is not Git LFS on the default branch", async () => {
+  const elsewhere = (root) => {
+    const dir = withFiles({ ".gitattributes": "*.txt text eol=lf\n", "README.md": "Run git lfs track to get filter=lfs.\n", "notes.gitattributes": LFS_ATTRIBUTES })(root);
+    git(dir, "checkout", "-q", "agent/never-merged");
+    writeFileSync(path.join(dir, ".gitattributes"), LFS_ATTRIBUTES);
+    git(dir, "add", ".gitattributes");
+    git(dir, "commit", "-q", "-m", "LFS off the default branch");
+    git(dir, "checkout", "-q", "main");
+    return dir;
+  };
+  const run = await backupWithCode(GOOD_API, {}, elsewhere);
+  assert.equal(run.status, 0, run.stderr);
+  assert.doesNotMatch(run.stdout, /Git LFS/);
+  assert.equal(run.checkins[0].codeLfs, false);
+});
+
+test("a code copy that never went up says nothing of Git LFS, even for a repository that uses it", async () => {
+  const run = await backupWithCode(
+    { ...GOOD_API, [`/repos/${REPO}/issues`]: { status: 403, body: { message: "Resource not accessible by integration" } } },
+    {},
+    withFiles({ ".gitattributes": LFS_ATTRIBUTES }),
+  );
+  assert.notEqual(run.status, 0);
+  assert.equal(existsSync(path.join(run.uploads, "lifeboat", "repo")), false);
+  assert.doesNotMatch(run.stdout, /Git LFS/);
+  assert.equal(run.checkins[0].codeBranches, null);
+  assert.equal(run.checkins[0].codeLfs, null, "no code copy, so the check-in claims nothing either way");
+});
+
+test("an empty repository, or one whose HEAD names a branch that does not exist, copies without failing and reads as no Git LFS", async () => {
+  const empty = (root) => {
+    const dir = path.join(root, "server", "acme", "notes.git");
+    mkdirSync(dir, { recursive: true });
+    git(dir, "init", "-q", "-b", "main");
+    return dir;
+  };
+  const none = await backupWithCode(GOOD_API, {}, empty);
+  assert.equal(none.status, 0, none.stderr);
+  assert.match(none.stdout, /acme\/notes has no commits yet, so this copy holds no code\./);
+  assert.match(none.stdout, /Code: 0 branches, 0 tags\./);
+  assert.doesNotMatch(none.stdout, /Git LFS/);
+  assert.equal(none.checkins[0].ok, true);
+  assert.equal(none.checkins[0].codeBranches, 0);
+  assert.equal(none.checkins[0].codeLfs, false);
+
+  // Branches, one of them using Git LFS, but HEAD points nowhere: git grep has no tree to read, and says so only to
+  // itself, not the log.
+  const unborn = (root) => {
+    const dir = withFiles({ ".gitattributes": LFS_ATTRIBUTES })(root);
+    git(dir, "symbolic-ref", "HEAD", "refs/heads/nothing");
+    return dir;
+  };
+  const headless = await backupWithCode(GOOD_API, {}, unborn);
+  assert.equal(headless.status, 0, headless.stderr);
+  assert.match(headless.stdout, /Code: 3 branches, 3 tags\./);
+  assert.doesNotMatch(headless.stdout, /Git LFS/);
+  assert.doesNotMatch(headless.stderr, /fatal|HEAD/);
+  assert.equal(headless.checkins[0].codeLfs, false);
+});
+
+const ONE_SUBMODULE_WARNING =
+  "::warning::acme/notes uses 1 submodule. The code copy holds only the commit it points at, not its files, so back up that repository as well.";
+const TWO_SUBMODULES_WARNING =
+  "::warning::acme/notes uses 2 submodules. The code copy holds only the commit each one points at, not its files, so back up those repositories as well.";
+
+/**
+ * A repository (sourceRepo's unless another is given) with a submodule at each of these paths on its checked-out
+ * branch, as git records one: a .gitmodules and a gitlink to a commit in another repository, which this one never holds.
+ */
+function withSubmodules(paths, repository = sourceRepo) {
+  return (root) => {
+    const dir = repository(root);
+    const gitmodules = paths.map((name) => `[submodule "${name}"]\n\tpath = ${name}\n\turl = https://github.com/acme/${path.basename(name)}.git\n`);
+    writeFileSync(path.join(dir, ".gitmodules"), gitmodules.join(""));
+    git(dir, "add", ".gitmodules");
+    paths.forEach((name, index) => git(dir, "update-index", "--add", "--cacheinfo", `160000,${String(index + 1).repeat(40)},${name}`));
+    git(dir, "commit", "-q", "-m", "submodules");
+    return dir;
+  };
+}
+
+test("a default branch with submodules, at the top or deeper, warns in the log with how many and tells the check-in", async () => {
+  for (const [paths, warning] of [
+    [["ui"], ONE_SUBMODULE_WARNING],
+    [["libs/ui", "vendor/deep/sdk"], TWO_SUBMODULES_WARNING],
+  ]) {
+    const run = await backupWithCode(GOOD_API, {}, withSubmodules(paths));
+    assert.equal(run.status, 0, run.stderr);
+    const lines = run.stdout.split("\n");
+    const code = lines.findIndex((line) => line.startsWith("Code: 3 branches, 3 tags."));
+    assert.ok(code >= 0, run.stdout);
+    assert.equal(lines[code + 1], warning, paths.join());
+    assert.equal(run.checkins[0].ok, true);
+    assert.equal(run.checkins[0].codeSubmodules, paths.length);
+    assert.equal(run.checkins[0].codeLfs, false);
+    assert.equal(run.checkins[0].codeBranches, 3);
+  }
+
+  // Git LFS and submodules both: one warning each, Git LFS first.
+  const both = await backupWithCode(GOOD_API, {}, withSubmodules(["libs/ui", "libs/api"], withFiles({ ".gitattributes": LFS_ATTRIBUTES })));
+  assert.equal(both.status, 0, both.stderr);
+  const lines = both.stdout.split("\n");
+  const code = lines.findIndex((line) => line.startsWith("Code: 3 branches, 3 tags."));
+  assert.deepEqual(lines.slice(code + 1, code + 3), [LFS_WARNING, TWO_SUBMODULES_WARNING]);
+  assert.deepEqual([both.checkins[0].codeLfs, both.checkins[0].codeSubmodules], [true, 2]);
+});
+
+test("a submodule only on another branch, or a .gitmodules with no gitlink, is no submodule on the default branch", async () => {
+  const elsewhere = (root) => {
+    const dir = withFiles({ ".gitmodules": '[submodule "ui"]\n\tpath = ui\n\turl = https://github.com/acme/ui.git\n' })(root);
+    git(dir, "checkout", "-q", "agent/never-merged");
+    withSubmodules(["ui"], () => dir)(root);
+    git(dir, "checkout", "-q", "main");
+    return dir;
+  };
+  const run = await backupWithCode(GOOD_API, {}, elsewhere);
+  assert.equal(run.status, 0, run.stderr);
+  assert.doesNotMatch(run.stdout, /submodule/);
+  assert.equal(run.checkins[0].codeSubmodules, 0);
+});
+
+test("a code copy that never went up says nothing of submodules, even for a repository that has them", async () => {
+  const run = await backupWithCode(
+    { ...GOOD_API, [`/repos/${REPO}/issues`]: { status: 403, body: { message: "Resource not accessible by integration" } } },
+    {},
+    withSubmodules(["libs/ui", "libs/api"]),
+  );
+  assert.notEqual(run.status, 0);
+  assert.equal(existsSync(path.join(run.uploads, "lifeboat", "repo")), false);
+  assert.doesNotMatch(run.stdout, /submodule/);
+  assert.equal(run.checkins[0].codeBranches, null);
+  assert.equal(run.checkins[0].codeSubmodules, null, "no code copy, so the check-in claims no count");
+});
+
+test("an empty repository, or a default branch git cannot read, copies without failing and sends no submodule count", async () => {
+  const empty = (root) => {
+    const dir = path.join(root, "server", "acme", "notes.git");
+    mkdirSync(dir, { recursive: true });
+    git(dir, "init", "-q", "-b", "main");
+    return dir;
+  };
+  const none = await backupWithCode(GOOD_API, {}, empty);
+  assert.equal(none.status, 0, none.stderr);
+  assert.match(none.stdout, /Code: 0 branches, 0 tags\./);
+  assert.doesNotMatch(none.stdout, /submodule/);
+  assert.equal(none.checkins[0].ok, true);
+  assert.equal(none.checkins[0].codeBranches, 0);
+  assert.equal(none.checkins[0].codeSubmodules, null, "no tree to count in");
+
+  // Branches, one with submodules, but HEAD points nowhere: git ls-tree has no tree to read, so the count is left out
+  // rather than sent as 0, and the night still passes.
+  const unborn = (root) => {
+    const dir = withSubmodules(["libs/ui", "libs/api"])(root);
+    git(dir, "symbolic-ref", "HEAD", "refs/heads/nothing");
+    return dir;
+  };
+  const headless = await backupWithCode(GOOD_API, {}, unborn);
+  assert.equal(headless.status, 0, headless.stderr);
+  assert.match(headless.stdout, /Code: 3 branches, 3 tags\./);
+  assert.doesNotMatch(headless.stdout, /submodule/);
+  assert.doesNotMatch(headless.stderr, /fatal|HEAD/);
+  assert.equal(headless.checkins[0].ok, true);
+  assert.equal(headless.checkins[0].codeBranches, 3);
+  assert.equal(headless.checkins[0].codeSubmodules, null);
+});
+
+/** A tar that prints `message` and fails when it packs `archive`, and is the real tar for everything else. */
+function tarFailing(archive, message) {
+  const realTar = execFileSync("sh", ["-c", "command -v tar"], { encoding: "utf8" }).trim();
+  const file = path.join(mkdtempSync(path.join(tmpdir(), "lg-tar-message-")), "message");
+  writeFileSync(file, message);
+  return `#!/bin/sh
+case " $* " in
+  *"/${archive} "*) cat "${file}" >&2; exit 2 ;;
+esac
+exec "${realTar}" "$@"
+`;
+}
+
+/** tar's message on a full disk, and on a failure of another kind. Each names a file the job log may show but the check-in may not. */
+const TAR_CASES = [
+  ["tar: /home/runner/work/_temp/tmp.Xy12Ab/%s: Cannot write: No space left on device\ntar: Error is not recoverable: exiting now", "The runner ran out of disk while packing %s into one archive."],
+  ["tar: ./github/issues.json: Cannot open: Permission denied\ntar: Exiting with failure status due to previous errors", "tar could not pack %s into one archive. Its message is in this run's log in GitHub Actions."],
+];
+const TAR_WORDS = /_temp|tmp\.|\.tar\.gz|issues\.json|Cannot|Permission denied|Error is not recoverable/;
+
+test("code that cannot be packed into one archive fails the code part with a sentence that says why, and tar's message stays in the log", async () => {
+  for (const [message, reason] of TAR_CASES) {
+    const tarMessage = message.replace("%s", "code.tar.gz");
+    const run = await backupWithCode(GOOD_API, {}, sourceRepo, { tar: tarFailing("code.tar.gz", tarMessage) });
+    assert.notEqual(run.status, 0, tarMessage);
+    const [checkin] = run.checkins;
+    assert.equal(checkin.ok, false);
+    assert.equal(checkin.error, `${reason.replace("%s", "the code")} Nothing was uploaded for the code.`);
+    assert.ok(checkin.error.length <= 300, `${checkin.error.length}`);
+    assert.doesNotMatch(checkin.error, /failed with status/);
+    assert.doesNotMatch(checkin.error, TAR_WORDS, "none of tar's own words");
+    assert.ok(run.stderr.includes(tarMessage), "tar's own message is in the run's log");
+    assert.match(run.stderr, /The users check still runs; then this run fails\./, "the code part fails alone");
+    assert.equal(checkin.codeBranches, null, "no counts for a code copy that never went up");
+    assert.equal(readdirSync(path.join(run.uploads, "lifeboat", "db")).length, 1, "the database copy still went up");
+    assert.equal(existsSync(path.join(run.uploads, "lifeboat", "repo")), false);
+    assert.equal(existsSync(path.join(run.work, "code")), false, "nothing of the code is left on the runner");
+    assert.equal(existsSync(path.join(run.work, "code.tar.gz")), false, "nor the archive tar left part written");
+  }
 });
 
 /** A call that never answers until its signal gives up, on a 5 ms clock in place of the real timeout. */

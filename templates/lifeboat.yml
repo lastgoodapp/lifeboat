@@ -86,8 +86,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Start the restore database
         # If no database starts, this step fails but Lifeboat still runs, so the failed test restore is reported
-        # instead of never checking in.
+        # instead of never checking in. An image pull that hangs stops at 20 minutes for the same reason: left to the
+        # job's 90, it ended the job before Lifeboat ran.
         continue-on-error: true
+        timeout-minutes: 20
         run: |
           set -eu
           url_file="${RUNNER_TEMP}/lifeboat-restore-url"

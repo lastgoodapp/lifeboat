@@ -266,12 +266,16 @@ function sha256(file) {
 
 const thisMonth = () => new Date().toISOString().slice(0, 7).replace("-", "");
 
+/** What a run's check-in said the month's monthly copy came to, and why. */
+const monthlySent = (run) => [run.checkins[0].monthlyState, run.checkins[0].monthlyReason];
+
 test("monthly copies are off by default", async () => {
   const run = await backup();
   assert.equal(run.status, 0, run.stderr);
   assert.equal(existsSync(path.join(run.uploads, "lifeboat", "monthly")), false);
   assert.doesNotMatch(run.log, /\/monthly\//);
   assert.equal(run.checkins[0].copies.length, 1);
+  assert.deepEqual(monthlySent(run), ["off", null]);
 });
 
 test("with monthly copies on, the first good backup of the month copies the dump inside the bucket and reports it", async () => {
@@ -289,6 +293,7 @@ test("with monthly copies on, the first good backup of the month copies the dump
     { key: `lifeboat/monthly/${month}/db/${name}`, bytes: readFileSync(nightly).length, sha256: sha256(nightly), versionId: VERSION_ID },
   ]);
   assert.equal(run.checkins[0].ok, true);
+  assert.deepEqual(monthlySent(run), ["made", null]);
 });
 
 test("with encryption off, the month's first night keeps the synced files as one archive in the monthly copy", async () => {
@@ -320,6 +325,7 @@ test("with encryption off, the month's first night keeps the synced files as one
   const recorded = plain.checkins[0].copies.find((copy) => copy.key === `lifeboat/monthly/${month}/storage/${name}`);
   assert.deepEqual(recorded, { key: `lifeboat/monthly/${month}/storage/${name}`, bytes: readFileSync(archive).length, sha256: sha256(archive), versionId: VERSION_ID });
   assert.equal(existsSync(path.join(plain.dir, "work", "monthly-storage.tar")), false);
+  assert.deepEqual(monthlySent(plain), ["made", null]);
 
   // A later night this month, with the files' monthly copy already there, keeps no archive and makes no second one.
   const later = await backup({
@@ -333,6 +339,7 @@ test("with encryption off, the month's first night keeps the synced files as one
   assert.deepEqual(readdirSync(path.join(later.uploads, "lifeboat", "monthly", month, "storage")), [`${month}01T161700Z.tar`]);
   assert.match(later.stdout, new RegExp(`This month's monthly copy is already in lifeboat/monthly/${month}/\\.`));
   assert.ok(later.checkins[0].copies.every((copy) => !copy.key.includes("/monthly/")));
+  assert.deepEqual(monthlySent(later), ["already", null]);
 
   // Encrypted, the files are one copy like the rest and go in by the usual route. Without monthly copies, or without
   // this key keeping them, nothing is kept.
@@ -368,10 +375,16 @@ test("a files archive that won't upload fails the night and says the next backup
     "The monthly copy of the files was not made. Tonight's copies are in the bucket, and the next backup tries the monthly copy again.",
   );
   assert.equal(existsSync(path.join(run.uploads, "lifeboat", "monthly", thisMonth(), "storage")), false);
+  // The database's monthly copy went up first, but a night whose monthly copy failed says no state: its error says why.
+  assert.ok(existsSync(path.join(run.uploads, "lifeboat", "monthly", thisMonth(), "db")));
+  assert.deepEqual(monthlySent(run), [null, null]);
 });
 
 test("a monthly copy whose check-in never got through is removed, so a later backup this month makes and records it", async () => {
-  const run = await backup({ extra: { LIFEBOAT_MONTHLY_COPIES: "true", LIFEBOAT_CHECKIN_WAIT_MS: "1" }, checkinStatus: 503 });
+  // The first of this month, so the run is never on the month's last day, which says something else (the test below).
+  const today = new Date();
+  const firstDay = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 1, 16, 17)).toISOString();
+  const run = await backup({ extra: { LIFEBOAT_MONTHLY_COPIES: "true", LIFEBOAT_CHECKIN_WAIT_MS: "1" }, checkinStatus: 503, now: firstDay });
   assert.equal(run.status, 1);
   assert.equal(run.checkins.length, 3, "the check-in was tried three times");
   const name = nightlyDump(run.uploads);
@@ -468,6 +481,7 @@ test("a part already copied this month is left alone, and a part that is missing
   });
   assert.equal(filled.status, 0, filled.stderr);
   assert.equal(readdirSync(path.join(filled.uploads, "lifeboat", "monthly", month, "db")).length, 1);
+  assert.deepEqual(monthlySent(filled), ["made", null], "a part filled in is made too");
 
   const done = await backup({
     extra: { LIFEBOAT_MONTHLY_COPIES: "true" },
@@ -477,9 +491,10 @@ test("a part already copied this month is left alone, and a part that is missing
   assert.deepEqual(readdirSync(path.join(done.uploads, "lifeboat", "monthly", month, "db")), ["20000101T000000Z.backup.age"]);
   assert.match(done.stdout, new RegExp(`This month's monthly copy is already in lifeboat/monthly/${month}/\\.`));
   assert.equal(done.checkins[0].copies.length, 1);
+  assert.deepEqual(monthlySent(done), ["already", null]);
 });
 
-test("when the bucket's own rule decides retention, monthly copies are not made and the log warns", async () => {
+test("when the bucket's own rule decides retention, monthly copies are not made, the log warns and the check-in says why", async () => {
   const run = await backup({ extra: { LIFEBOAT_MONTHLY_COPIES: "true", LIFEBOAT_MANAGE_RETENTION: "false" } });
   assert.equal(run.status, 0, run.stderr);
   assert.equal(existsSync(path.join(run.uploads, "lifeboat", "monthly")), false);
@@ -488,6 +503,8 @@ test("when the bucket's own rule decides retention, monthly copies are not made 
     /::warning::Monthly copies are on, but no monthly copy was made: this bucket's own rule decides how long copies are kept, and no monthly bucket is set\./,
   );
   assert.doesNotMatch(run.log, /list-objects-v2|s3 rm /);
+  assert.equal(run.checkins[0].ok, true);
+  assert.deepEqual(monthlySent(run), ["none", "no-monthly-bucket"]);
 });
 
 test("a monthly copy that cannot be made fails the run, which still reports the night's copy", async () => {
@@ -499,6 +516,7 @@ test("a monthly copy that cannot be made fails the run, which still reports the 
   assert.match(run.checkins[0].error, /The monthly copy of/);
   assert.deepEqual(run.checkins[0].copies.map((copy) => copy.key), [`lifeboat/db/${name}`]);
   assert.doesNotMatch(run.log, / s3 rm /, "retention did not run");
+  assert.deepEqual(monthlySent(run), [null, null]);
 });
 
 test("a monthly copy that comes out the wrong size is removed, never recorded, and fails the run", async () => {
@@ -576,6 +594,7 @@ test("on LastGood's storage, the month's first good backup is copied to the mont
   assert.ok(reported, "the monthly copy is in the check-in's copies");
   assert.equal(reported.sha256, sha256(monthly));
   assert.equal(reported.versionId, VERSION_ID);
+  assert.deepEqual(monthlySent(run), ["made", null]);
 });
 
 test("on LastGood's storage with encryption off, the files archive goes to the monthly bucket with the other monthly copies", async () => {

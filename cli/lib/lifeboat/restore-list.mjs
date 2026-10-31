@@ -444,7 +444,7 @@ function describePostgisUse(needs) {
 export function planPostgis(options) {
   const needs = postgisNeeds(options.toc, options.schemaSql);
   const image = options.image ?? null;
-  const base = { ...needs, missing: [], container: "", image: image ?? "", url: "", port: 0 };
+  const base = { ...needs, missing: [], container: "", image: image ?? "", url: "", port: 0, checkin: "" };
   if (!needs.needed) return { ...base, decision: "none", message: "The dump does not use PostGIS." };
   const offered = nameSet(options.available);
   const missing = needs.required.filter((name) => !offered.has(name));
@@ -453,13 +453,21 @@ export function planPostgis(options) {
     return { ...base, decision: "ok", message: `The dump uses PostGIS (${uses}). The restore database offers ${needs.required.join(", ")}.` };
   }
   const lacking = missing.join(", ");
-  const stop = (reason) => ({
+  // The message goes to the job log. The check-in, which keeps 300 characters, gets the short form: what to do,
+  // without the extension and type names.
+  const stop = (reason, short = reason) => ({
     ...base,
     missing,
     decision: "fail",
     message: `The dump uses PostGIS (${uses}), and the restore database does not offer ${lacking}. PostGIS is not a Supabase-only extension, so it is not skipped. ${reason} The restore test stopped before restoring.`,
+    checkin: `The dump uses PostGIS, which the restore database does not offer. ${short} The restore test stopped before restoring.`,
   });
-  if (options.switched) return stop(`The PostGIS image ${image} started but does not offer ${lacking} either.`);
+  if (options.switched) {
+    return stop(
+      `The PostGIS image ${image} started but does not offer ${lacking} either.`,
+      `The PostGIS image ${image} started but does not offer it either.`,
+    );
+  }
   const container = String(options.container ?? "").trim();
   const suggestion = image ?? "a PostGIS image such as postgis/postgis:17-3.5";
   if (!container) {
@@ -731,7 +739,7 @@ function runPostgisPlan(tocPath, schemaPath, extensionsPath, outPath, switchedTe
     restoreUrl: process.env.RESTORE_DATABASE_URL ?? "",
     switched: switchedText === "switched",
   });
-  const lines = [plan.decision, plan.message, plan.container, plan.image, String(plan.port || ""), plan.url];
+  const lines = [plan.decision, plan.message, plan.container, plan.image, String(plan.port || ""), plan.url, plan.checkin];
   writeFileSync(outPath, `${lines.map((line) => String(line).replace(/[\r\n]+/g, " ")).join("\n")}\n`);
 }
 
@@ -759,6 +767,7 @@ function commandOutput(command, args, spawnImpl) {
 export async function verifySampleCounts(options) {
   const tables = selectSampleTables(options.toc, options.skipped, 12).slice(0, 12);
   let checked = 0;
+  let empty = 0;
   for (const table of tables) {
     if (checked >= SAMPLE_LIMIT) break;
     const sizeSql = `SELECT COALESCE(pg_total_relation_size(format('%I.%I', '${table.schema}', '${table.table}')), -1)`;
@@ -789,11 +798,21 @@ export async function verifySampleCounts(options) {
     if (restored !== dumped) {
       throw new Error(`Row count mismatch for ${table.schema}.${table.table}: restored ${restored}, dump ${dumped}.`);
     }
+    // A table empty in the dump matches when nothing loads at all, so it shows no rows came back: the next one is tried.
+    if (dumped === 0) {
+      empty += 1;
+      process.stdout.write(`Row count matched for ${table.schema}.${table.table}: 0, an empty table, so it does not count towards the sample.\n`);
+      continue;
+    }
     checked += 1;
     process.stdout.write(`Row count matched for ${table.schema}.${table.table}: ${restored}.\n`);
   }
   if (checked === 0) {
-    process.stdout.write("Row-count sample skipped: no small user table in the dump.\n");
+    process.stdout.write(
+      empty > 0
+        ? "Row-count sample: no small user table checked has rows in the dump, so no rows were compared.\n"
+        : "Row-count sample skipped: no small user table in the dump.\n",
+    );
   }
 }
 

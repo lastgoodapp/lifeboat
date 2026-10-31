@@ -385,6 +385,65 @@ test("the row-count sample counts a table named with capitals, as Prisma names t
   assert.deepEqual(written, ["Row count matched for public.User: 2.\n"]);
 });
 
+/** Runs the row-count sample over public tables with these row counts, dump and restored alike unless `restored` says. */
+async function sampleRows(rows, restored = rows) {
+  const names = Object.keys(rows);
+  const toc = names.flatMap((name, index) => [`${90 + index}; 1259 ${9000 + index} TABLE public ${name} postgres`, `${120 + index}; 0 ${9000 + index} TABLE DATA public ${name} postgres`]).join("\n");
+  const written = [];
+  const stdout = process.stdout.write;
+  process.stdout.write = (text) => written.push(String(text));
+  try {
+    await verifySampleCounts({
+      toc,
+      skipped: { schemas: [] },
+      dumpPath: "/tmp/restore.backup",
+      psql: "psql",
+      pgRestore: "pg_restore",
+      databaseUrl: "postgresql://postgres:throwaway@localhost/restore",
+      spawnImpl(command, args) {
+        const sql = String(args.at(-1) ?? "");
+        let body = "8192\n";
+        if (sql.startsWith("SELECT count")) body = `${restored[sql.match(/"public"\."(\w+)"$/)[1]]}\n`;
+        if (command === "pg_restore") {
+          const table = args[args.indexOf("-t") + 1];
+          body = `COPY public.${table} (id) FROM stdin;\n${Array.from({ length: rows[table] }, (_, row) => `${row + 1}\n`).join("")}\\.\n`;
+        }
+        return {
+          stdout: { on(event, fn) { if (event === "data") fn(body); } },
+          stderr: { on() {} },
+          on(event, fn) { if (event === "close") fn(0); },
+        };
+      },
+    });
+  } finally {
+    process.stdout.write = stdout;
+  }
+  return written;
+}
+
+test("the row-count sample passes over a table empty in the dump, which matches with nothing loaded, and samples three with rows", async () => {
+  assert.deepEqual(await sampleRows({ audit: 0, b: 2, c: 0, d: 1, e: 3, f: 4 }), [
+    "Row count matched for public.audit: 0, an empty table, so it does not count towards the sample.\n",
+    "Row count matched for public.b: 2.\n",
+    "Row count matched for public.c: 0, an empty table, so it does not count towards the sample.\n",
+    "Row count matched for public.d: 1.\n",
+    "Row count matched for public.e: 3.\n",
+  ]);
+});
+
+test("the row-count sample says no rows were compared when every small table it checks is empty in the dump", async () => {
+  assert.deepEqual(await sampleRows({ a: 0, b: 0 }), [
+    "Row count matched for public.a: 0, an empty table, so it does not count towards the sample.\n",
+    "Row count matched for public.b: 0, an empty table, so it does not count towards the sample.\n",
+    "Row-count sample: no small user table checked has rows in the dump, so no rows were compared.\n",
+  ]);
+  assert.deepEqual(await sampleRows({}), ["Row-count sample skipped: no small user table in the dump.\n"]);
+});
+
+test("the row-count sample still fails a table empty in the dump that came back with rows", async () => {
+  await assert.rejects(sampleRows({ a: 0, b: 2 }, { a: 5, b: 2 }), /Row count mismatch for public\.a: restored 5, dump 0\./);
+});
+
 /** `pg_restore --list` of a Supabase-style dump: PostGIS in the extensions schema, dumped with --no-owner. */
 const POSTGIS_TOC = `
 ;
@@ -588,6 +647,44 @@ test("a dump that needs PostGIS switches the container, or fails and names PostG
   assert.equal(supabaseOnly.decision, "none");
 });
 
+test("a PostGIS stop checks in a short form that fits the check-in's 300 characters and leaves the names to the log", () => {
+  const stock = {
+    toc: `${POSTGIS_TOC}\n9; 3079 16390 EXTENSION - postgis_sfcgal postgres\n10; 3079 16391 EXTENSION - postgis_raster postgres\n11; 3079 16392 EXTENSION - postgis_topology postgres\n`,
+    schemaSql: POSTGIS_SQL,
+    available: ["plpgsql"],
+    container: "lifeboat-restore",
+    image: "postgis/postgis:17-3.5",
+    restoreUrl: "postgresql://postgres:throwaway@localhost:5432/restore",
+  };
+  const stops = {
+    noContainer: planPostgis({ ...stock, container: "" }),
+    badContainer: planPostgis({ ...stock, container: "bad name; rm" }),
+    noImage: planPostgis({ ...stock, image: null }),
+    remote: planPostgis({ ...stock, restoreUrl: "postgresql://postgres:x@db.example.com:5432/restore" }),
+    stillMissing: planPostgis({ ...stock, available: ["plpgsql", "postgis"], switched: true }),
+  };
+  for (const [name, plan] of Object.entries(stops)) {
+    assert.equal(plan.decision, "fail", name);
+    assert.ok(plan.message.length > 300, `${name}: the log's message is the long one this is for`);
+    assert.ok(plan.checkin.length <= 300, `${name}: ${plan.checkin.length} characters`);
+    assert.match(plan.checkin, /^The dump uses PostGIS, which the restore database does not offer\. .+ The restore test stopped before restoring\.$/, name);
+    assert.doesNotMatch(plan.checkin, /extensions\.|geometry|geography|postgis_|Supabase-only|throwaway@|db\.example\.com/, name);
+  }
+  assert.equal(
+    stops.noContainer.checkin,
+    "The dump uses PostGIS, which the restore database does not offer. Lifeboat was not given a throwaway container to replace (LIFEBOAT_RESTORE_CONTAINER). Start the restore database from postgis/postgis:17-3.5. The restore test stopped before restoring.",
+  );
+  assert.equal(
+    stops.stillMissing.checkin,
+    "The dump uses PostGIS, which the restore database does not offer. The PostGIS image postgis/postgis:17-3.5 started but does not offer it either. The restore test stopped before restoring.",
+  );
+  // Only a stop has a short form: the other plans never reach the check-in.
+  for (const plan of [planPostgis(stock), planPostgis({ ...stock, available: ["plpgsql", "postgis", "postgis_sfcgal", "postgis_raster", "postgis_topology"] })]) {
+    assert.notEqual(plan.decision, "fail");
+    assert.equal(plan.checkin, "");
+  }
+});
+
 test("the PostGIS plan names one extension or type in the singular and more than one in the plural", () => {
   const plan = planPostgis({
     toc: "2; 3079 16385 EXTENSION - postgis postgres\n3; 3079 16386 EXTENSION - postgis_raster postgres\n",
@@ -642,6 +739,8 @@ test("postgis-plan takes the container, the image and the restore database from 
       "postgis/postgis:16-3.5",
       "55432",
       restoreUrl,
+      // The check-in's short form, which only a stop has.
+      "",
       "",
     ]);
     // Postgres 11 has no PostGIS image: the image line is left empty for run.sh.
@@ -649,6 +748,7 @@ test("postgis-plan takes the container, the image and the restore database from 
     assert.equal(old[0], "fail");
     assert.match(old[1], /no pinned PostGIS image for this Postgres major/);
     assert.equal(old[3], "");
+    assert.match(old[6], /^The dump uses PostGIS, which the restore database does not offer\. There is no pinned PostGIS image/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1003,6 +1103,25 @@ test("checkin.mjs sends the time of the database copy a test restore opened, nev
   assert.doesNotMatch(body, /backup\.age|20261029T/);
 });
 
+test("checkin.mjs sends a backup's monthly state, its reason only beside none, nothing it does not know, and nothing for a test restore", async () => {
+  const sent = async (env) => {
+    const body = JSON.parse((await checkinAgainst([200], { env })).received[0].body);
+    return [body.monthlyState, body.monthlyReason];
+  };
+  const why = { LIFEBOAT_MONTHLY_REASON: "no-monthly-bucket" };
+  for (const state of ["off", "made", "already"]) {
+    assert.deepEqual(await sent({ LIFEBOAT_MONTHLY_STATE: state, ...why }), [state, null], state);
+  }
+  assert.deepEqual(await sent({ LIFEBOAT_MONTHLY_STATE: "none", ...why }), ["none", "no-monthly-bucket"]);
+  // A reason or state it does not know, or none at all (a night that ended before its monthly copy), sends no guess.
+  assert.deepEqual(await sent({ LIFEBOAT_MONTHLY_STATE: "none", LIFEBOAT_MONTHLY_REASON: "a-later-reason" }), ["none", null]);
+  for (const state of ["skipped", "NONE", ""]) {
+    assert.deepEqual(await sent({ LIFEBOAT_MONTHLY_STATE: state, ...why }), [null, null], state);
+  }
+  assert.deepEqual(await sent({}), [null, null]);
+  assert.deepEqual(await sent({ LIFEBOAT_KIND: "restore-test", LIFEBOAT_MONTHLY_STATE: "none", ...why }), [null, null]);
+});
+
 test("checkin.mjs sends the copies a test restore opened with their SHA-256, at most four and only well-formed, and none for a backup", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "lg-checkin-opened-"));
   const file = path.join(dir, "opened.tsv");
@@ -1050,6 +1169,7 @@ test("checkin.mjs sends run.sh's counts, sources, copies and error as numbers an
         LIFEBOAT_DUMP_BYTES: "1234",
         LIFEBOAT_STORAGE_OBJECTS: "many",
         LIFEBOAT_STORAGE_SOURCE: "s3",
+        LIFEBOAT_SETUP_SOURCE: "none",
         LIFEBOAT_VERCEL_SOURCE: "token",
         LIFEBOAT_CODE_BRANCHES: "3",
         LIFEBOAT_CODE_TAGS: "",
@@ -1064,6 +1184,7 @@ test("checkin.mjs sends run.sh's counts, sources, copies and error as numbers an
     assert.equal(body.storageObjects, 0, "a count that is not a number reads as none");
     assert.equal(body.retentionDays, 0, "a count run.sh left out reads as none");
     assert.equal(body.storageSource, "s3");
+    assert.equal(body.setupSource, "none");
     assert.equal(body.vercelSource, "token");
     assert.equal(body.codeBranches, 3);
     assert.equal(body.codeTags, null);
@@ -1084,22 +1205,30 @@ test("checkin.mjs sends no source it does not know, and no copies when run.sh up
   try {
     // run.sh removes the copies file at the start, so a run that uploaded nothing leaves none behind.
     const unknown = await checkinAgainst([200], {
-      env: { LIFEBOAT_STORAGE_SOURCE: "bucket", LIFEBOAT_VERCEL_SOURCE: "maybe", LIFEBOAT_COPIES_FILE: path.join(dir, "missing.tsv") },
+      env: { LIFEBOAT_STORAGE_SOURCE: "bucket", LIFEBOAT_SETUP_SOURCE: "maybe", LIFEBOAT_VERCEL_SOURCE: "maybe", LIFEBOAT_COPIES_FILE: path.join(dir, "missing.tsv") },
     });
     const backup = JSON.parse(unknown.received[0].body);
     assert.equal(backup.storageSource, null);
+    assert.equal(backup.setupSource, null);
     assert.equal(backup.vercelSource, null);
     assert.deepEqual(backup.copies, []);
     assert.equal(backup.error, null);
 
     // run.sh passes empty sources when a run copied neither, and a run without it passes none at all.
-    for (const env of [{ LIFEBOAT_STORAGE_SOURCE: "", LIFEBOAT_VERCEL_SOURCE: "" }, {}]) {
+    for (const env of [{ LIFEBOAT_STORAGE_SOURCE: "", LIFEBOAT_SETUP_SOURCE: "", LIFEBOAT_VERCEL_SOURCE: "" }, {}]) {
       const { received } = await checkinAgainst([200], { env });
       const plain = JSON.parse(received[0].body);
       assert.equal(plain.storageSource, null, JSON.stringify(env));
+      assert.equal(plain.setupSource, null, JSON.stringify(env));
       assert.equal(plain.vercelSource, null, JSON.stringify(env));
       assert.deepEqual(plain.copies, [], JSON.stringify(env));
     }
+
+    // A test restore makes no copies, so it names no source, even one run.sh passes.
+    const restore = await checkinAgainst([200], { env: { LIFEBOAT_KIND: "restore-test", LIFEBOAT_SETUP_SOURCE: "token", LIFEBOAT_VERCEL_SOURCE: "token" } });
+    const restored = JSON.parse(restore.received[0].body);
+    assert.equal(restored.setupSource, null);
+    assert.equal(restored.vercelSource, null);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

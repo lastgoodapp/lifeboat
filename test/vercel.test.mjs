@@ -393,15 +393,20 @@ test("the settings copy fails on a token Vercel refuses or a DNS read that error
   assert.throws(() => projectSettings([PROJECT_JSON]), /something other than a project/);
 });
 
-// The whole backup, with fake tools and a fake Vercel API on a local port.
-function fakeTools(dir) {
+// The whole backup, with fake tools and a fake Vercel API on a local port. An upload to `refuse` is refused.
+function fakeTools(dir, { refuse = "", tar = "" } = {}) {
   const uploads = path.join(dir, "uploads");
   mkdirSync(uploads);
+  if (tar) {
+    writeFileSync(path.join(dir, "tar"), tar);
+    chmodSync(path.join(dir, "tar"), 0o755);
+  }
   writeFileSync(path.join(dir, "pg_dump"), '#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  if [ "$1" = "--file" ]; then printf \'dump\' > "$2"; exit 0; fi\n  shift\ndone\nexit 1\n');
   writeFileSync(
     path.join(dir, "aws"),
     `#!/bin/sh
 echo "$*" >> "${dir}/aws.log"
+${refuse ? `case " $* " in *" ${refuse}"*) echo "upload failed: An error occurred (AccessDenied) when calling the PutObject operation: Access Denied" >&2; exit 1 ;; esac` : ""}
 case " $* " in
   *" s3api "*) printf '%s\\n' '{"Contents":[]}' ;;
   *" s3 cp "*)
@@ -441,9 +446,9 @@ async function fakeVercel(routes) {
   return { server, port: server.address().port, checkins };
 }
 
-async function backupWithVercel(routes, extra = {}) {
+async function backupWithVercel(routes, extra = {}, tools = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "lg-vercel-run-"));
-  const uploads = fakeTools(dir);
+  const uploads = fakeTools(dir, tools);
   const work = path.join(dir, "work");
   mkdirSync(work);
   const keyFile = path.join(dir, "key.txt");
@@ -584,6 +589,65 @@ test("a settings copy that fails still uploads the environment variables, then f
   assert.equal(run.checkins[0].vercelEnvVars, 5);
   assert.equal(run.checkins[0].vercelDomains, null);
   assert.ok(!run.stderr.includes(TOKEN) && !shown(run.stdout).includes(TOKEN));
+});
+
+test("a Vercel copy the bucket refuses checks in with no Vercel counts, and the database copy before it keeps its size", async () => {
+  const run = await backupWithVercel(answers(), {}, { refuse: "s3://bucket/lifeboat/vercel/" });
+  assert.equal(run.status, 1);
+  const [checkin] = run.checkins;
+  assert.equal(checkin.ok, false);
+  assert.match(checkin.error, /^The storage refused the keys/);
+  for (const field of ["vercelEnvVars", "vercelEnvValues", "vercelDomains", "vercelDnsRecords", "vercelDnsUnreadable"]) {
+    assert.equal(checkin[field], null, `${field}: no counts for a Vercel copy that never went up`);
+  }
+  assert.equal(checkin.vercelSource, "token");
+  assert.equal(checkin.dumpBytes, 4, "the database copy went up first and keeps its size");
+  assert.deepEqual(checkin.copies.map((copy) => copy.key.split("/")[1]), ["db"]);
+  assert.equal(existsSync(path.join(run.uploads, "lifeboat", "vercel")), false);
+  assert.ok(!run.stderr.includes(TOKEN) && !shown(run.stdout).includes(TOKEN));
+});
+
+/** A tar that prints `message` and fails when it packs `archive`, and is the real tar for everything else. */
+function tarFailing(archive, message) {
+  const realTar = execFileSync("sh", ["-c", "command -v tar"], { encoding: "utf8" }).trim();
+  const file = path.join(mkdtempSync(path.join(tmpdir(), "lg-tar-message-")), "message");
+  writeFileSync(file, message);
+  return `#!/bin/sh
+case " $* " in
+  *"/${archive} "*) cat "${file}" >&2; exit 2 ;;
+esac
+exec "${realTar}" "$@"
+`;
+}
+
+/** tar's message on a full disk, and on a failure of another kind. Each names a file the job log may show but the check-in may not. */
+const TAR_CASES = [
+  ["tar: /home/runner/work/_temp/tmp.Xy12Ab/%s: Cannot write: No space left on device\ntar: Error is not recoverable: exiting now", "The runner ran out of disk while packing %s into one archive."],
+  ["tar: ./github/issues.json: Cannot open: Permission denied\ntar: Exiting with failure status due to previous errors", "tar could not pack %s into one archive. Its message is in this run's log in GitHub Actions."],
+];
+const TAR_WORDS = /_temp|tmp\.|\.tar\.gz|issues\.json|Cannot|Permission denied|Error is not recoverable/;
+
+test("a Vercel copy that cannot be packed into one archive fails the Vercel part with a sentence that says why, and leaves no value on the runner", async () => {
+  for (const [message, reason] of TAR_CASES) {
+    const tarMessage = message.replace("%s", "vercel.tar.gz");
+    const run = await backupWithVercel(answers(), {}, { tar: tarFailing("vercel.tar.gz", tarMessage) });
+    assert.equal(run.status, 1, tarMessage);
+    const [checkin] = run.checkins;
+    assert.equal(checkin.ok, false);
+    assert.equal(checkin.error, `${reason.replace("%s", "the Vercel copy")} Nothing was uploaded for Vercel.`);
+    assert.ok(checkin.error.length <= 300, `${checkin.error.length}`);
+    assert.doesNotMatch(checkin.error, /failed with status/);
+    assert.doesNotMatch(checkin.error, TAR_WORDS, "none of tar's own words");
+    assert.ok(run.stderr.includes(tarMessage), "tar's own message is in the run's log");
+    assert.match(run.stderr, /The users check still runs; then this run fails\./, "the Vercel part fails alone");
+    assert.equal(checkin.vercelEnvVars, null, "no counts for a Vercel copy that never went up");
+    assert.equal(checkin.dumpBytes, 4, "the database copy went up first and keeps its size");
+    assert.equal(existsSync(path.join(run.uploads, "lifeboat", "vercel")), false);
+    // The folder and an archive tar left part written hold the values in the clear.
+    assert.equal(existsSync(path.join(run.work, "vercel")), false, "the values are not left on the runner");
+    assert.equal(existsSync(path.join(run.work, "vercel.tar.gz")), false, "nor in the archive tar left part written");
+    assert.ok(!run.stderr.includes(ENCRYPTED_VALUE) && !shown(run.stdout).includes(ENCRYPTED_VALUE), "no value is printed");
+  }
 });
 
 /** A call that never answers until its signal gives up, on a 5 ms clock in place of the real timeout. */

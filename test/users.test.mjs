@@ -500,7 +500,7 @@ test("auth-verify writes the users it matched for run.sh, or none when the dump 
   }
 });
 
-function fakeTools(dir, toc) {
+function fakeTools(dir, toc, { failing = "", silent = "" } = {}) {
   const uploads = path.join(dir, "uploads");
   mkdirSync(uploads);
   writeFileSync(path.join(dir, "toc.txt"), toc);
@@ -522,6 +522,11 @@ for arg in "$@"; do
   [ "$prev" = "-t" ] && table="$arg"
   prev="$arg"
 done
+if [ "$table" = "${failing}" ]; then
+  echo 'pg_restore: error: could not read from input file "/home/runner/work/_temp/lifeboat/dump.backup": Input/output error' >&2
+  exit 1
+fi
+[ "$table" = "${silent}" ] && exit 0
 cat "${dir}/copy.$table"
 `,
     aws: `#!/bin/sh
@@ -542,9 +547,9 @@ exit 0
   return uploads;
 }
 
-async function backup(toc) {
+async function backup(toc, options = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "lg-users-"));
-  const uploads = fakeTools(dir, toc);
+  const uploads = fakeTools(dir, toc, options);
   const work = path.join(dir, "work");
   mkdirSync(work);
   const checkins = [];
@@ -596,6 +601,30 @@ test("a backup reports its users on their own line and in the check-in, and neve
   assert.equal(run.checkins[0].authUsersWithPassword, 2);
   assert.equal(run.checkins[0].authIdentities, 3);
   assert.equal(existsSync(path.join(run.work, "backup.toc")), false);
+});
+
+for (const failing of ["users", "identities"]) {
+  test(`pg_restore failing to read auth.${failing} back fails the run with a fixed sentence, and its message stays in the log`, async () => {
+    const run = await backup(TOC, { failing });
+    assert.notEqual(run.status, 0);
+    assert.equal(readdirSync(run.uploads).length, 1, "the database copy still went up");
+    assert.equal(run.checkins[0].ok, false);
+    assert.equal(
+      run.checkins[0].error,
+      "pg_restore could not read the users back out of the dump it just made, so they were not counted. Its message is in this run's log in GitHub Actions. Everything else this run copies was uploaded first.",
+    );
+    assert.doesNotMatch(JSON.stringify(run.checkins[0]), /pg_restore: error|Input\/output|\/home\/runner/);
+    assert.match(run.stderr, /pg_restore: error: could not read from input file "\/home\/runner\/work\/_temp\/lifeboat\/dump\.backup": Input\/output error/);
+  });
+}
+
+test("pg_restore returning no auth.identities rows keeps restore-list's own sentence in the check-in", async () => {
+  const run = await backup(TOC, { silent: "identities" });
+  assert.notEqual(run.status, 0);
+  assert.equal(
+    run.checkins[0].error,
+    "pg_restore did not return the auth.identities rows. Everything else this run copies was uploaded first.",
+  );
 });
 
 test("auth.users without its rows fails the run after the copies are up", async () => {

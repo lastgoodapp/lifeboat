@@ -387,15 +387,20 @@ test("a token that is not scoped still copies, with a warning to replace it", as
 const AUTH_TOC = "230; 1259 17500 TABLE auth users supabase_auth_admin\n4270; 0 17500 TABLE DATA auth users supabase_auth_admin\n";
 const AUTH_USERS_COPY = "COPY auth.users (instance_id, id, email, encrypted_password) FROM stdin;\n\\N\tu1\ta@users.test\t$2a$10$hash\n\\N\tu2\tb@users.test\t\n\\.\n";
 
-function fakeTools(dir, { users = false } = {}) {
+function fakeTools(dir, { users = false, refuse = "", tar = "" } = {}) {
   const uploads = path.join(dir, "uploads");
   mkdirSync(uploads);
+  if (tar) {
+    writeFileSync(path.join(dir, "tar"), tar);
+    chmodSync(path.join(dir, "tar"), 0o755);
+  }
   writeFileSync(path.join(dir, "pg_dump"), '#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  if [ "$1" = "--file" ]; then printf \'dump\' > "$2"; exit 0; fi\n  shift\ndone\nexit 1\n');
-  // Keeps each upload under its object key, folders and all, and logs every call.
+  // Keeps each upload under its object key, folders and all, and logs every call. An upload to `refuse` is refused.
   writeFileSync(
     path.join(dir, "aws"),
     `#!/bin/sh
 echo "$*" >> "${dir}/aws.log"
+${refuse ? `case " $* " in *" ${refuse}"*) echo "upload failed: An error occurred (AccessDenied) when calling the PutObject operation: Access Denied" >&2; exit 1 ;; esac` : ""}
 case " $* " in
   *" s3api "*) printf '%s\\n' '{"Contents":[]}' ;;
   *" s3 cp "*)
@@ -543,6 +548,7 @@ test("backup uploads the Edge Functions and settings in one age archive under se
   assert.equal(run.checkins[0].setupFunctions, 2);
   assert.equal(run.checkins[0].setupCronJobs, 2);
   assert.ok(run.checkins[0].setupBytes > 0);
+  assert.equal(run.checkins[0].setupSource, "token");
 });
 
 test("without LIFEBOAT_SUPABASE_TOKEN the setup copy is skipped and the check-in says not copied", async () => {
@@ -552,6 +558,7 @@ test("without LIFEBOAT_SUPABASE_TOKEN the setup copy is skipped and the check-in
   assert.equal(existsSync(path.join(run.uploads, "lifeboat", "setup")), false);
   assert.equal(run.checkins[0].setupFunctions, null);
   assert.equal(run.checkins[0].setupBytes, null);
+  assert.equal(run.checkins[0].setupSource, "none", "so the status page and the alert emails can say there is no setup copy");
 });
 
 test("with encryption off the setup copy is skipped with a warning, never uploaded in the clear", async () => {
@@ -560,6 +567,7 @@ test("with encryption off the setup copy is skipped with a warning, never upload
   assert.match(run.stdout, /::warning::Supabase setup copy skipped: encryption is off/);
   assert.equal(existsSync(path.join(run.uploads, "lifeboat", "setup")), false);
   assert.equal(run.checkins[0].setupFunctions, null);
+  assert.equal(run.checkins[0].setupSource, null);
 });
 
 test("a token without a permission fails the run by name, after the database copy, and uploads no setup", async () => {
@@ -589,6 +597,61 @@ test("a setup 403 still reports the users counts, then fails before retention ca
   const calls = readFileSync(path.join(run.dir, "aws.log"), "utf8");
   assert.doesNotMatch(calls, /list-objects-v2|s3 rm /, "retention did not run");
   assert.equal(readdirSync(path.join(run.uploads, "lifeboat", "db")).length, 1, "the database copy still went up");
+});
+
+test("a setup copy the bucket refuses checks in with no setup counts, and the database copy before it keeps its size", async () => {
+  const run = await backupWithSetup(answers(), {}, { refuse: "s3://bucket/lifeboat/setup/" });
+  assert.equal(run.status, 1);
+  const [checkin] = run.checkins;
+  assert.equal(checkin.ok, false);
+  assert.match(checkin.error, /^The storage refused the keys/);
+  assert.equal(checkin.setupFunctions, null, "no counts for a setup copy that never went up");
+  assert.equal(checkin.setupCronJobs, null);
+  assert.equal(checkin.setupBytes, null);
+  assert.equal(checkin.dumpBytes, 4, "the database copy went up first and keeps its size");
+  assert.deepEqual(checkin.copies.map((copy) => copy.key.split("/")[1]), ["db"]);
+  assert.equal(existsSync(path.join(run.uploads, "lifeboat", "setup")), false);
+});
+
+/** A tar that prints `message` and fails when it packs `archive`, and is the real tar for everything else. */
+function tarFailing(archive, message) {
+  const realTar = execFileSync("sh", ["-c", "command -v tar"], { encoding: "utf8" }).trim();
+  const file = path.join(mkdtempSync(path.join(tmpdir(), "lg-tar-message-")), "message");
+  writeFileSync(file, message);
+  return `#!/bin/sh
+case " $* " in
+  *"/${archive} "*) cat "${file}" >&2; exit 2 ;;
+esac
+exec "${realTar}" "$@"
+`;
+}
+
+/** tar's message on a full disk, and on a failure of another kind. Each names a file the job log may show but the check-in may not. */
+const TAR_CASES = [
+  ["tar: /home/runner/work/_temp/tmp.Xy12Ab/%s: Cannot write: No space left on device\ntar: Error is not recoverable: exiting now", "The runner ran out of disk while packing %s into one archive."],
+  ["tar: ./github/issues.json: Cannot open: Permission denied\ntar: Exiting with failure status due to previous errors", "tar could not pack %s into one archive. Its message is in this run's log in GitHub Actions."],
+];
+const TAR_WORDS = /_temp|tmp\.|\.tar\.gz|issues\.json|Cannot|Permission denied|Error is not recoverable/;
+
+test("a setup copy that cannot be packed into one archive fails the setup part with a sentence that says why, and tar's message stays in the log", async () => {
+  for (const [message, reason] of TAR_CASES) {
+    const tarMessage = message.replace("%s", "setup.tar.gz");
+    const run = await backupWithSetup(answers(), {}, { tar: tarFailing("setup.tar.gz", tarMessage) });
+    assert.equal(run.status, 1, tarMessage);
+    const [checkin] = run.checkins;
+    assert.equal(checkin.ok, false);
+    assert.equal(checkin.error, `${reason.replace("%s", "the Supabase setup")} Nothing was uploaded for the Supabase setup.`);
+    assert.ok(checkin.error.length <= 300, `${checkin.error.length}`);
+    assert.doesNotMatch(checkin.error, /failed with status/);
+    assert.doesNotMatch(checkin.error, TAR_WORDS, "none of tar's own words");
+    assert.ok(run.stderr.includes(tarMessage), "tar's own message is in the run's log");
+    assert.match(run.stderr, /The users check still runs; then this run fails\./, "the setup part fails alone");
+    assert.equal(checkin.setupFunctions, null, "no counts for a setup copy that never went up");
+    assert.equal(checkin.dumpBytes, 4, "the database copy went up first and keeps its size");
+    assert.equal(existsSync(path.join(run.uploads, "lifeboat", "setup")), false);
+    assert.equal(existsSync(path.join(run.work, "setup")), false, "nothing of the setup is left on the runner");
+    assert.equal(existsSync(path.join(run.work, "setup.tar.gz")), false, "nor the archive tar left part written");
+  }
 });
 
 test("a database URL that names no project ref asks for supabase-project-ref", async () => {

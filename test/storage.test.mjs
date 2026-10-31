@@ -331,14 +331,21 @@ exit 2
 `;
 }
 
+/**
+ * `tools.refuse` is a destination the fake bucket refuses, as a bucket refuses keys that may not write there.
+ * `tools.fail` is { on, message }: any aws call with `on` in it prints the message and fails.
+ */
 function fakeTools(dir, tools = {}) {
   const uploads = path.join(dir, "uploads");
   mkdirSync(uploads);
+  if (tools.fail) writeFileSync(path.join(dir, "aws.fail"), tools.fail.message);
   writeFileSync(path.join(dir, "pg_dump"), '#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  if [ "$1" = "--file" ]; then printf \'dump\' > "$2"; exit 0; fi\n  shift\ndone\nexit 1\n');
   writeFileSync(
     path.join(dir, "aws"),
     `#!/bin/sh
 echo "$*" >> "${dir}/aws.log"
+${tools.refuse ? `case " $* " in *" ${tools.refuse}"*) echo "upload failed: An error occurred (AccessDenied) when calling the PutObject operation: Access Denied" >&2; exit 1 ;; esac` : ""}
+${tools.fail ? `case " $* " in *"${tools.fail.on}"*) cat "${dir}/aws.fail" >&2; exit 1 ;; esac` : ""}
 case " $* " in
   *" s3api "*) printf '%s\\n' '{"Contents":[]}' ;;
   *" s3 ls "*) echo "2024-01-01 00:00:00 media" ;;
@@ -377,6 +384,10 @@ exit 0
   if (tools.age) {
     writeFileSync(path.join(dir, "age"), tools.age);
     chmodSync(path.join(dir, "age"), 0o755);
+  }
+  if (tools.tar) {
+    writeFileSync(path.join(dir, "tar"), tools.tar);
+    chmodSync(path.join(dir, "tar"), 0o755);
   }
   return uploads;
 }
@@ -646,6 +657,173 @@ test("the files query is read only and carries the names as one dollar-quoted va
   // The name holds $lastgood$, so the quote is a tag the names don't.
   assert.ok(sql.includes(`$lastgood_$[{"b":"docs","n":"x$lastgood$y 'q'.pdf"},{"b":"avatars","n":"a/1.png"}]$lastgood_$::json`));
   assert.equal(sql.split("$lastgood_$").length, 3);
+});
+
+/** The parts of the bucket a night's recorded copies are in, such as db and storage. */
+function copiedParts(checkin) {
+  return checkin.copies.map((copy) => copy.key.split("/")[1]);
+}
+
+test("files the bucket refuses check in with no files count, encrypted or not, and the database copy before them keeps its size", async () => {
+  const plain = { LIFEBOAT_ENCRYPT: "false", LIFEBOAT_PUBLIC_KEY: "" };
+  const s3 = {
+    LIFEBOAT_STORAGE_LOGIN: "",
+    STORAGE_S3_ENDPOINT: "https://abcdefghijklmnopqrst.storage.supabase.co/storage/v1/s3",
+    STORAGE_S3_ACCESS_KEY_ID: "unit-test-storage-key-id",
+    STORAGE_S3_SECRET_ACCESS_KEY: "unit-test-storage-secret-not-real",
+  };
+  const cases = [
+    ["encrypted, read with the storage login", {}, "login"],
+    ["unencrypted, read with the storage login", plain, "login"],
+    ["unencrypted, read with S3 keys", { ...plain, ...s3 }, "s3"],
+  ];
+  for (const [label, extra, source] of cases) {
+    const run = await backupWithStorage(extra, {}, { refuse: "s3://bucket/lifeboat/storage/" });
+    assert.equal(run.status, 1, label);
+    const [checkin] = run.checkins;
+    assert.equal(checkin.ok, false, label);
+    assert.match(checkin.error, /^The storage refused the keys/, label);
+    assert.equal(checkin.storageSource, source, label);
+    assert.equal(checkin.storageObjects, 0, `${label}: no count for files that never went up`);
+    assert.equal(checkin.dumpBytes, 4, `${label}: the database copy went up first and keeps its size`);
+    assert.deepEqual(copiedParts(checkin), ["db"], label);
+    assert.equal(existsSync(path.join(run.uploads, "lifeboat", "storage")), false, label);
+  }
+});
+
+test("a disk that fills while the files are archived checks in with no files count, and the database copy before them keeps its size", async () => {
+  const realTar = execFileSync("sh", ["-c", "command -v tar"], { encoding: "utf8" }).trim();
+  const tar = `#!/bin/sh
+case " $* " in
+  *"/storage.tar "*) echo "tar: storage.tar: Cannot write: No space left on device" >&2; exit 2 ;;
+esac
+exec "${realTar}" "$@"
+`;
+  const run = await backupWithStorage({}, {}, { tar });
+  assert.notEqual(run.status, 0);
+  const [checkin] = run.checkins;
+  assert.equal(checkin.ok, false);
+  assert.equal(checkin.storageObjects, 0, "no count for files that never went up");
+  assert.equal(checkin.dumpBytes, 4, "the database copy went up first and keeps its size");
+  assert.deepEqual(copiedParts(checkin), ["db"]);
+});
+
+/** A tar that prints `message` and fails when it packs `archive`, and is the real tar for everything else. */
+function tarFailing(archive, message) {
+  const realTar = execFileSync("sh", ["-c", "command -v tar"], { encoding: "utf8" }).trim();
+  const file = path.join(mkdtempSync(path.join(tmpdir(), "lg-tar-message-")), "message");
+  writeFileSync(file, message);
+  return `#!/bin/sh
+case " $* " in
+  *"/${archive} "*) cat "${file}" >&2; exit 2 ;;
+esac
+exec "${realTar}" "$@"
+`;
+}
+
+/** The check-in carries the step's fixed sentence, never the tool's own words, and the tool's message stays in the log. */
+function assertReason(label, run, error, message, words) {
+  assert.notEqual(run.status, 0, label);
+  assert.equal(run.checkins.length, 1, label);
+  const [checkin] = run.checkins;
+  assert.equal(checkin.ok, false, label);
+  assert.equal(checkin.error, error, label);
+  // The check-in keeps 300 characters, so the whole sentence must fit.
+  assert.ok(checkin.error.length <= 300, `${label}: ${checkin.error.length}`);
+  assert.doesNotMatch(checkin.error, /failed with status/, label);
+  assert.doesNotMatch(checkin.error, words, `${label}: none of the tool's own words`);
+  assert.ok(run.stderr.includes(message), `${label}: the tool's own message is in the run's log`);
+}
+
+const DISK = "The runner ran out of disk while packing the files into one archive.";
+const TAR_FAILED = "tar could not pack the files into one archive. Its message is in this run's log in GitHub Actions.";
+const TAR_WORDS = /storage\.tar|_temp|tmp\.|invoices|inv-1|avatars|Wrote only|Cannot|Permission denied|Error is not recoverable/;
+const TAR_CASES = [
+  ["tar: /home/runner/work/_temp/tmp.Xy12Ab/storage.tar: Cannot write: No space left on device\ntar: Error is not recoverable: exiting now", DISK],
+  ["tar: /home/runner/work/_temp/tmp.Xy12Ab/storage.tar: Wrote only 4096 of 10240 bytes\ntar: Error is not recoverable: exiting now", DISK],
+  ["tar: ./invoices/2026/10/inv-1.pdf: Cannot open: Permission denied\ntar: Exiting with failure status due to previous errors", TAR_FAILED],
+];
+
+test("files that cannot be packed into one archive check in with a sentence that says why, and tar's own message stays in the log", async () => {
+  for (const [message, reason] of TAR_CASES) {
+    const run = await backupWithStorage({}, {}, { tar: tarFailing("storage.tar", message) });
+    assertReason(message, run, `${reason} Nothing was uploaded for the files.`, message, TAR_WORDS);
+    assert.equal(run.checkins[0].storageObjects, 0, message);
+    assert.deepEqual(copiedParts(run.checkins[0]), ["db"], message);
+    assert.match(run.stderr, /The users check still runs; then this run fails\./, "the files part fails alone");
+    assert.equal(existsSync(path.join(run.work, "storage")), false, "nothing of the files is left on the runner");
+    assert.equal(existsSync(path.join(run.work, "storage.tar")), false, "nor the archive tar left part written");
+  }
+});
+
+test("a month's first files archive that cannot be made fails the monthly copy by name, and tonight's files still went up", async () => {
+  for (const [message, reason] of TAR_CASES) {
+    const run = await backupWithStorage(
+      { LIFEBOAT_ENCRYPT: "false", LIFEBOAT_PUBLIC_KEY: "", LIFEBOAT_MONTHLY_COPIES: "true", LIFEBOAT_MANAGE_RETENTION: "true" },
+      {},
+      { tar: tarFailing("monthly-storage.tar", message) },
+    );
+    assertReason(
+      message,
+      run,
+      `This month's monthly copy was not made: ${reason} Tonight's files are in the bucket, and the next backup tries the monthly copy again.`,
+      message,
+      TAR_WORDS,
+    );
+    assert.equal(run.checkins[0].storageObjects, 7, "tonight's files went up, so they keep their count");
+    assert.ok(existsSync(path.join(run.uploads, "lifeboat", "storage")), "tonight's files are in the bucket");
+    assert.equal(existsSync(path.join(run.uploads, "lifeboat", "monthly")), false, "no monthly copy was made");
+    assert.equal(existsSync(path.join(run.work, "monthly-storage.tar")), false, "the archive tar left part written is gone");
+  }
+});
+
+test("files the project's own Storage S3 keys cannot read check in with a sentence that says why, and aws's message stays in the log", async () => {
+  const s3 = {
+    LIFEBOAT_STORAGE_LOGIN: "",
+    STORAGE_S3_ENDPOINT: "https://abcdefghijklmnopqrst.storage.supabase.co/storage/v1/s3",
+    STORAGE_S3_ACCESS_KEY_ID: "unit-test-storage-key-id",
+    STORAGE_S3_SECRET_ACCESS_KEY: "unit-test-storage-secret-not-real",
+  };
+  const cases = [
+    [
+      " s3 ls ",
+      "An error occurred (InvalidAccessKeyId) when calling the ListBuckets operation: The AWS Access Key Id you provided does not exist in our records.",
+      "Supabase Storage refused the S3 access keys this workflow reads the files with. Check them in your project's Storage settings, or connect again in LastGood to make the storage login.",
+    ],
+    [
+      " s3 ls ",
+      'Could not connect to the endpoint URL: "https://abcdefghijklmnopqrst.storage.supabase.co/storage/v1/s3/"',
+      "Supabase Storage didn't answer, or was too busy, while the files were copied. The next run tries again.",
+    ],
+    [
+      " s3 sync s3://",
+      "download failed: s3://media/2024/a.png to storage/media/2024/a.png [Errno 28] No space left on device",
+      "The runner ran out of disk while copying the files from Supabase Storage.",
+    ],
+    [
+      " s3 sync s3://",
+      "fatal error: An error occurred (InternalError) when calling the ListObjectsV2 operation (reached max retries: 2): We encountered an internal error. Please try again.",
+      "aws could not copy the files from Supabase Storage. Its message is in this run's log in GitHub Actions.",
+    ],
+  ];
+  for (const [on, message, reason] of cases) {
+    const run = await backupWithStorage(s3, {}, { fail: { on, message } });
+    assertReason(message, run, `${reason} Nothing was uploaded for the files.`, message, /media|a\.png|supabase\.co|s3:\/\/|Errno|ListBuckets|InternalError|unit-test/);
+    assert.equal(run.checkins[0].storageSource, "s3", message);
+    assert.equal(run.checkins[0].storageObjects, 0, message);
+    assert.equal(run.checkins[0].dumpBytes, 4, "the database copy went up first and keeps its size");
+    assert.deepEqual(copiedParts(run.checkins[0]), ["db"], message);
+    assert.match(run.stderr, /The users check still runs; then this run fails\./, "the files part fails alone");
+    assert.equal(existsSync(path.join(run.work, "storage")), false, "nothing of the files is left on the runner");
+  }
+});
+
+test("files a storage policy hides from the login still check in with the count that went up (B5)", async () => {
+  const run = await backupWithStorage({}, {}, { pgRestore: pgRestoreWithObjects(30) });
+  assert.notEqual(run.status, 0);
+  assert.equal(run.checkins[0].ok, false);
+  assert.equal(run.checkins[0].storageObjects, 7, "the files it could read are in the bucket");
+  assert.deepEqual(copiedParts(run.checkins[0]), ["db", "storage"]);
 });
 
 test("a copy that matches the dump's files says nothing more, and passes", async () => {
