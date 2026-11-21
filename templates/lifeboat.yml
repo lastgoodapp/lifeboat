@@ -78,8 +78,9 @@ jobs:
   restore-test:
     needs: backup
     # Strict mode keeps no private key in this repository, so there is nothing here to open a copy with. The connect
-    # wizard sets LIFEBOAT_STRICT to true for it, and to false with a key whose private half is here.
-    if: always() && vars.LIFEBOAT_STRICT != 'true' && (github.event_name == 'push' && needs.backup.result == 'success' || github.event_name == 'schedule' && github.event.schedule == '17 17 1 * *' || github.event.inputs.mode == 'restore-test')
+    # wizard sets LIFEBOAT_STRICT to true for it, and to false with a key whose private half is here. An app connected
+    # with only its repository (LIFEBOAT_PROJECT is gh- and the repository's id) has no database copy to restore.
+    if: always() && vars.LIFEBOAT_STRICT != 'true' && !startsWith(vars.LIFEBOAT_PROJECT, 'gh-') && (github.event_name == 'push' && needs.backup.result == 'success' || github.event_name == 'schedule' && github.event.schedule == '17 17 1 * *' || github.event.inputs.mode == 'restore-test')
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:

@@ -883,3 +883,53 @@ test("github-metadata.mjs --count reads a folder back and prints its counts, and
   assert.equal(failed.stderr, "The GitHub metadata copy failed.\n");
   assert.equal(failed.stdout, "");
 });
+
+// C7: an app connected on LastGood with only its repository. No DATABASE_URL, and LIFEBOAT_PROJECT is gh-<repository id>.
+test("a code-only app copies its code with no database, and checks in a good night with no database part", async () => {
+  const run = await backupWithCode(GOOD_API, { DATABASE_URL: "", LIFEBOAT_PROJECT: "gh-4242" });
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stdout, /connected with only its repository \(LIFEBOAT_PROJECT=gh-4242\), so no database or files are copied/);
+  assert.equal(readdirSync(path.join(run.uploads, "lifeboat", "repo")).length, 1);
+  assert.equal(existsSync(path.join(run.uploads, "lifeboat", "db")), false, "no database copy");
+  assert.equal(existsSync(path.join(run.uploads, "lifeboat", "storage")), false, "no files copy");
+  assert.equal(run.checkins.length, 1);
+  assert.equal(run.checkins[0].ok, true);
+  assert.equal(run.checkins[0].dumpBytes, 0);
+  assert.equal(run.checkins[0].codeBranches, 3);
+  assert.equal(run.checkins[0].authUsers, null, "no users check without a dump");
+  assert.equal(run.checkins[0].storageSource, null, "no files line: there is no Supabase to read them from");
+});
+
+test("a code-only night whose code copy fails is a failed night, never a good one", async () => {
+  const run = await backupWithCode({ ...GOOD_API, [`/repos/${REPO}/issues`]: { status: 500, body: { message: "down" } } }, { DATABASE_URL: "", LIFEBOAT_PROJECT: "gh-4242" });
+  assert.notEqual(run.status, 0);
+  assert.equal(run.checkins.length, 1);
+  assert.equal(run.checkins[0].ok, false);
+  assert.equal(existsSync(path.join(run.uploads, "lifeboat", "repo")), false);
+});
+
+test("a code-only night outside GitHub Actions copies nothing, so it fails instead of reading good", async () => {
+  const run = await backupWithCode(GOOD_API, { DATABASE_URL: "", LIFEBOAT_PROJECT: "gh-4242", GITHUB_REPOSITORY: "" });
+  assert.notEqual(run.status, 0);
+  assert.match(run.stderr, /connected with only its repository, and the code copy runs only in GitHub Actions/);
+  assert.equal(run.checkins[0].ok, false);
+});
+
+test("an empty DATABASE_URL still fails the night for a Supabase app, or for any name that isn't gh- and a repository id", async () => {
+  for (const project of ["abcdefghijklmnopqrst", "", "gh-", "gh-0", "gh-012", "gh-12345678901234567", "GH-4242", "gh-4242x"]) {
+    const run = await backupWithCode(GOOD_API, { DATABASE_URL: "", LIFEBOAT_PROJECT: project });
+    assert.notEqual(run.status, 0, project);
+    assert.match(run.stderr, /^Set DATABASE_URL\./m, project);
+    assert.equal(run.checkins[0].ok, false, project);
+    assert.equal(existsSync(path.join(run.uploads, "lifeboat", "repo")), false, project);
+  }
+});
+
+test("a code-only app's test restore fails, as there is no database copy, and never reads as restored", async () => {
+  const run = await backupWithCode(GOOD_API, { LIFEBOAT_MODE: "restore-test", DATABASE_URL: "", LIFEBOAT_PROJECT: "gh-4242", RESTORE_DATABASE_URL: "postgres://example.invalid/restore" });
+  assert.notEqual(run.status, 0);
+  assert.match(run.stderr, /no database copy to test-restore\. Nothing was restored\./);
+  assert.equal(run.checkins.length, 1);
+  assert.equal(run.checkins[0].kind, "restore-test");
+  assert.equal(run.checkins[0].ok, false);
+});

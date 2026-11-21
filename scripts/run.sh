@@ -1728,7 +1728,32 @@ ensure_postgis() {
   rm -f "$WORKDIR/restore.schema.sql" "$WORKDIR/postgis.plan"
 }
 
-if [[ "$MODE" == "backup" ]]; then
+# C7: an app connected on LastGood with only its repository has no DATABASE_URL, and LIFEBOAT_PROJECT is gh- and the
+# repository's numeric id. Its night copies the code, and the Vercel project when it has a token. Without that name an
+# empty DATABASE_URL still fails the night: a Supabase app whose secret went missing must not read as a good night.
+CODE_ONLY=false
+if [[ -z "${DATABASE_URL:-}" && "${LIFEBOAT_PROJECT:-}" =~ ^gh-[1-9][0-9]{0,15}$ ]]; then
+  CODE_ONLY=true
+fi
+
+if [[ "$MODE" == "backup" && "$CODE_ONLY" == "true" ]]; then
+  # Outside GitHub Actions the code copy is skipped, which would leave nothing copied and a night that reads good.
+  [[ -n "${GITHUB_REPOSITORY:-}" ]] ||
+    fail "This app is connected with only its repository, and the code copy runs only in GitHub Actions, which names the repository. Nothing was copied."
+  if [[ "$ENCRYPT" == "true" ]]; then
+    resolve_recipient
+  fi
+  echo "This app is connected with only its repository (LIFEBOAT_PROJECT=${LIFEBOAT_PROJECT}), so no database or files are copied. Copying the code."
+  copy_code
+  copy_vercel_env
+  [[ -z "$PART_ERRORS" ]] || fail "$(part_errors)"
+  [[ -n "$CODE_BRANCHES" ]] || fail "The code copy did not run, so nothing was copied tonight."
+  make_monthly_copies
+  apply_retention
+elif [[ "$MODE" == "restore-test" && "$CODE_ONLY" == "true" ]]; then
+  # Never a good restore test: there is no database copy, and LastGood must not hear that one was restored.
+  fail "This app is connected with only its repository, so it has no database copy to test-restore. Nothing was restored. Its workflow should skip the test restore: update it from LastGood."
+elif [[ "$MODE" == "backup" ]]; then
   [[ -n "${DATABASE_URL:-}" ]] || fail "Set DATABASE_URL. Use the Supabase Session pooler on port 5432 (aws-*.pooler.supabase.com), not the direct db.*.supabase.co host and not the transaction pooler on port 6543."
   [[ -x "$PG_DUMP" ]] || command -v "$PG_DUMP" >/dev/null || fail "pg_dump is not installed. The workflow should install postgresql-client."
   # Check the keys before reading anything, so a bad key never costs a dump.

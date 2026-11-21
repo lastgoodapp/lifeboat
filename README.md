@@ -117,6 +117,8 @@ Set the endpoint to `https://<account-id>.r2.cloudflarestorage.com` and the regi
 
 For Supabase, LastGood can write `DATABASE_URL` after you connect the project. The URL is the Session pooler on port 5432. The username must include the project ref, like `lastgood_backup.<project-ref>`. When `project` is a Supabase project ref and the username names a different one, the run stops before copying anything and says so. The host looks like `aws-0-<region>.pooler.supabase.com`. Do not use the direct host `db.<project-ref>.supabase.co`. That host is IPv6-only, and GitHub-hosted runners fail with `Network is unreachable`. Do not use the transaction pooler on port 6543. A manual URL is the fallback. LastGood writes the secret and does not keep a copy.
 
+An app connected on LastGood with only its repository has no `DATABASE_URL`, and `project` is `gh-` and the repository's numeric id, such as `gh-4242`. Its backup copies the code, issues and pull requests, and the Vercel project when there is a token. No database or files are copied. Its test restore fails, since there is no database copy to restore, so its workflow skips it. With any other `project`, an empty `DATABASE_URL` fails the backup.
+
 ## Storage objects
 
 When you connect, LastGood makes a storage login on the Supabase project: a user, `lastgood-backup@lastgood.invalid`, with storage policies (named `lastgood_backup_...`) that let it read every bucket and file and never add, change or delete one. Supabase gives every signed-in user the `authenticated` role, so outside storage the login can do whatever the app lets any signed-in user do. LastGood writes:

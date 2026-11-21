@@ -95,7 +95,7 @@ inputs:
     required: false
     default: ""
   project:
-    description: Stable name sent with the check-in, such as the Supabase project ref.
+    description: Stable name sent with the check-in, such as the Supabase project ref. gh-<repository id> for an app with only its repository, which backs up without database-url.
     required: false
     default: ""
   checkin-url:
